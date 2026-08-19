@@ -1,0 +1,161 @@
+generator db {
+  provider = "go run github.com/steebchen/prisma-client-go"
+  output   = "../internal/db"
+  package  = "db"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model otp_codes {
+  id         String   @id @db.Uuid
+  user_id    String   @db.Uuid
+  code       String
+  type       OTPType
+  attempts   Int      @default(0)
+  expires_at DateTime
+  used       Boolean  @default(false)
+  created_at DateTime @default(now())
+  users      users    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+}
+
+model refresh_tokens {
+  id         String   @id @db.Uuid
+  user_id    String   @db.Uuid
+  token_hash String   @unique
+  expires_at DateTime
+  revoked    Boolean  @default(false)
+  created_at DateTime @default(now())
+  users      users    @relation(fields: [user_id], references: [id], onDelete: Cascade)
+}
+
+model users {
+  id             String           @id @db.Uuid
+  email          String           @unique
+  password       String
+  name           String
+  role           Role             @default(CUSTOMER)
+  is_active      Boolean          @default(false)
+  created_at     DateTime         @default(now())
+  updated_at     DateTime
+  otp_codes      otp_codes[]
+  refresh_tokens refresh_tokens[]
+}
+
+enum OTPType {
+  REGISTRATION
+  PASSWORD_RESET
+}
+
+enum Role {
+  CUSTOMER
+  ADMIN
+}
+
+model Product {
+  id          String           @id @default(uuid())
+  name        String
+  slug        String           @unique
+  description String?
+  basePrice   Float
+  category    String
+  isActive    Boolean          @default(true)
+  variants    ProductVariant[]
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@index([category, isActive])
+  @@index([createdAt(sort: Desc)])
+}
+
+model ProductVariant {
+  id        String   @id @default(uuid())
+  productId String
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  sku       String   @unique
+  size      String?
+  color     String?
+  price     Float?
+  stock     Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([productId])
+  @@index([size, color])
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAID
+  PROCESSING
+  SHIPPED
+  COMPLETED
+  CANCELLED
+  EXPIRED
+}
+
+enum OutboxStatus {
+  PENDING
+  PUBLISHED
+  FAILED
+}
+
+model Order {
+  id                    String      @id @default(uuid())
+  orderNumber           String      @unique
+  userId                String
+  userEmail             String
+  status                OrderStatus @default(PENDING_PAYMENT)
+  totalAmount           Float
+  shippingFee           Float       @default(0)
+  shippingAddress       String?
+  paymentType           String?
+  midtransTransactionId String?
+  snapToken             String?
+  snapRedirectUrl       String?
+  paidAt                DateTime?
+  expiresAt             DateTime?
+  items                 OrderItem[]
+  createdAt             DateTime    @default(now())
+  updatedAt             DateTime    @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt(sort: Desc)])
+}
+
+model OrderItem {
+  id          String   @id @default(uuid())
+  orderId     String
+  order       Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId   String
+  variantId   String
+  productName String
+  variantName String?
+  sku         String
+  price       Float
+  quantity    Int
+  subtotal    Float
+  createdAt   DateTime @default(now())
+
+  @@index([orderId])
+  @@index([variantId])
+}
+
+model OutboxEvent {
+  id            String       @id @default(uuid())
+  aggregateType String       @default("ORDER")
+  aggregateId   String
+  topic         String
+  payload       String       @db.Text
+  status        OutboxStatus @default(PENDING)
+  retryCount    Int          @default(0)
+  errorMessage  String?
+  createdAt     DateTime     @default(now())
+  publishedAt   DateTime?
+
+  @@index([status, createdAt])
+}

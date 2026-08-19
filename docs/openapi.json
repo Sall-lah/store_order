@@ -1,0 +1,372 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Store Order Microservice API",
+    "version": "1.0.0",
+    "description": "High-performance Order Lifecycle and Payment Gateway Microservice.\nPowered by Go (Chi router), PostgreSQL, Apache Kafka Transactional Outbox, and Midtrans Snap integration.\n"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8060",
+      "description": "Local Order Service"
+    },
+    {
+      "url": "/",
+      "description": "API Gateway Proxy"
+    }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["Health"],
+        "summary": "Health Check Probe",
+        "responses": {
+          "200": {
+            "description": "Service is healthy.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orders": {
+      "post": {
+        "tags": ["Customer Orders"],
+        "summary": "Create Order and Generate Snap Payment Token",
+        "security": [{ "GatewayUserIdAuth": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CheckoutRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Order created successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "get": {
+        "tags": ["Customer Orders"],
+        "summary": "List Authenticated Customer Orders",
+        "security": [{ "GatewayUserIdAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "List of customer orders.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderListResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orders/{id}": {
+      "get": {
+        "tags": ["Customer Orders"],
+        "summary": "Get Customer Order Details",
+        "security": [{ "GatewayUserIdAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Order details.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orders/{id}/cancel": {
+      "post": {
+        "tags": ["Customer Orders"],
+        "summary": "Cancel Unpaid Order",
+        "security": [{ "GatewayUserIdAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Order cancelled successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/orders/webhook/midtrans": {
+      "post": {
+        "tags": ["Payment Webhooks"],
+        "summary": "Midtrans Payment Callback Webhook",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MidtransWebhookPayload"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Webhook received and acknowledged."
+          }
+        }
+      }
+    },
+    "/api/v1/admin/orders": {
+      "get": {
+        "tags": ["Admin Orders"],
+        "summary": "List All Orders Across Customers",
+        "security": [{ "GatewayAdminRoleAuth": [] }],
+        "responses": {
+          "200": {
+            "description": "Filtered order list.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderListResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/admin/orders/{id}/status": {
+      "patch": {
+        "tags": ["Admin Orders"],
+        "summary": "Update Order Fulfillment Status",
+        "security": [{ "GatewayAdminRoleAuth": [] }],
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Order status updated.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrderResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/dev/orders/{id}/simulate-success": {
+      "post": {
+        "tags": ["Dev Simulation"],
+        "summary": "Simulate Successful Payment (DEV Mode)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Simulated success response."
+          }
+        }
+      }
+    },
+    "/api/v1/dev/orders/{id}/simulate-cancel": {
+      "post": {
+        "tags": ["Dev Simulation"],
+        "summary": "Simulate Order Cancellation (DEV Mode)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Simulated cancellation response."
+          }
+        }
+      }
+    },
+    "/api/v1/dev/orders/{id}/simulate-expire": {
+      "post": {
+        "tags": ["Dev Simulation"],
+        "summary": "Simulate Order Expiration (DEV Mode)",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": { "type": "string", "format": "uuid" }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Simulated expiration response."
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "GatewayUserIdAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-User-Id"
+      },
+      "GatewayAdminRoleAuth": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-User-Role"
+      }
+    },
+    "schemas": {
+      "HealthResponse": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string" },
+          "service": { "type": "string" },
+          "timestamp": { "type": "string" }
+        }
+      },
+      "CheckoutItemRequest": {
+        "type": "object",
+        "required": ["productId", "variantId", "quantity"],
+        "properties": {
+          "productId": { "type": "string" },
+          "variantId": { "type": "string" },
+          "quantity": { "type": "integer" }
+        }
+      },
+      "CheckoutRequest": {
+        "type": "object",
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/CheckoutItemRequest" }
+          },
+          "shippingFee": { "type": "number" },
+          "shippingAddress": { "type": "string" }
+        }
+      },
+      "OrderItemResponse": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "productId": { "type": "string" },
+          "variantId": { "type": "string" },
+          "productName": { "type": "string" },
+          "variantName": { "type": "string" },
+          "sku": { "type": "string" },
+          "price": { "type": "number" },
+          "quantity": { "type": "integer" },
+          "subtotal": { "type": "number" }
+        }
+      },
+      "OrderResponse": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "orderNumber": { "type": "string" },
+          "userId": { "type": "string" },
+          "userEmail": { "type": "string" },
+          "status": { "type": "string" },
+          "totalAmount": { "type": "number" },
+          "shippingFee": { "type": "number" },
+          "shippingAddress": { "type": "string" },
+          "paymentType": { "type": "string" },
+          "midtransTransactionId": { "type": "string" },
+          "snapToken": { "type": "string" },
+          "snapRedirectUrl": { "type": "string" },
+          "paidAt": { "type": "string" },
+          "expiresAt": { "type": "string" },
+          "items": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/OrderItemResponse" }
+          },
+          "createdAt": { "type": "string" },
+          "updatedAt": { "type": "string" }
+        }
+      },
+      "OrderListResponse": {
+        "type": "object",
+        "properties": {
+          "orders": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/OrderResponse" }
+          },
+          "total": { "type": "integer" },
+          "limit": { "type": "integer" },
+          "offset": { "type": "integer" }
+        }
+      },
+      "MidtransWebhookPayload": {
+        "type": "object",
+        "required": ["order_id", "status_code", "gross_amount", "signature_key", "transaction_status"],
+        "properties": {
+          "order_id": { "type": "string" },
+          "status_code": { "type": "string" },
+          "gross_amount": { "type": "string" },
+          "signature_key": { "type": "string" },
+          "transaction_status": { "type": "string" },
+          "fraud_status": { "type": "string" },
+          "payment_type": { "type": "string" },
+          "transaction_id": { "type": "string" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,123 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/Sall-lah/store_order/internal/config"
+	"github.com/Sall-lah/store_order/internal/db"
+	"github.com/Sall-lah/store_order/internal/handler"
+	"github.com/Sall-lah/store_order/internal/integration/midtrans"
+	"github.com/Sall-lah/store_order/internal/integration/product"
+	"github.com/Sall-lah/store_order/internal/kafka"
+	"github.com/Sall-lah/store_order/internal/outbox"
+	"github.com/Sall-lah/store_order/internal/repository"
+	"github.com/Sall-lah/store_order/internal/router"
+	"github.com/Sall-lah/store_order/internal/service"
+)
+
+func main() {
+	log.Println("[INFO] Starting store_order microservice...")
+
+	// 1. Load application configuration
+	cfg := config.Load()
+	log.Printf("[INFO] Configuration loaded (Port: %s, DevMode: %v, ProductURL: %s)",
+		cfg.Port, cfg.Dev, cfg.ProductServiceURL)
+
+	// 2. Initialize Prisma PostgreSQL client
+	prismaClient, err := db.InitClient(cfg.DatabaseURL)
+	if err != nil {
+		log.Printf("[WARN] Database connection warning: %v. Running in disconnected standby mode.", err)
+		prismaClient = db.NewClient()
+	} else {
+		log.Println("[INFO] Connected successfully to PostgreSQL database.")
+	}
+
+	defer func() {
+		if prismaClient != nil {
+			_ = prismaClient.Prisma.Disconnect()
+		}
+	}()
+
+	// 3. Initialize Kafka Producer
+	kafkaProducer := kafka.NewProducer(cfg.KafkaBrokers)
+	defer func() {
+		_ = kafkaProducer.Close()
+	}()
+
+	// 4. Initialize Repositories
+	orderRepo := repository.NewOrderRepository(prismaClient)
+	outboxRepo := repository.NewOutboxRepository(prismaClient)
+
+	// 5. Initialize Integrations
+	productClient := product.NewClient(cfg.ProductServiceURL)
+	midtransClient := midtrans.NewSnapClient(cfg.MidtransServerKey, cfg.MidtransIsProduction, cfg.Dev)
+
+	// 6. Initialize Order Service & Outbox Worker
+	orderService := service.NewOrderService(orderRepo, productClient, midtransClient, cfg.MidtransServerKey, cfg.Dev)
+	outboxWorker := outbox.NewWorker(outboxRepo, kafkaProducer, 200*time.Millisecond, 50, cfg.Dev)
+
+	workerCtx, workerCancel := context.WithCancel(context.Background())
+	defer workerCancel()
+	outboxWorker.Start(workerCtx)
+
+	// 7. Initialize Handlers
+	orderHandler := handler.NewOrderHandler(orderService)
+	webhookHandler := handler.NewWebhookHandler(orderService)
+	adminHandler := handler.NewAdminHandler(orderService)
+	devHandler := handler.NewDevHandler(orderService)
+	healthHandler := handler.NewHealthHandler(prismaClient)
+
+	// 8. Build Router
+	r := router.SetupRouter(router.RouterDeps{
+		Config:         cfg,
+		OrderHandler:   orderHandler,
+		WebhookHandler: webhookHandler,
+		AdminHandler:   adminHandler,
+		DevHandler:     devHandler,
+		HealthHandler:  healthHandler,
+	})
+
+	server := &http.Server{
+		Addr:         fmt.Sprintf(":%s", cfg.Port),
+		Handler:      r,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	// 9. Graceful shutdown handler
+	shutdownChan := make(chan os.Signal, 1)
+	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		log.Printf("[INFO] Server listening on port %s", cfg.Port)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("[FATAL] HTTP server runtime error: %v", err)
+		}
+	}()
+
+	<-shutdownChan
+	log.Println("[INFO] Shutting down store_order service gracefully...")
+
+	// Stop outbox worker
+	outboxWorker.Stop()
+	workerCancel()
+
+	// Shutdown HTTP server with timeout
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[ERROR] Server shutdown error: %v", err)
+	}
+
+	log.Println("[INFO] store_order service stopped gracefully.")
+}

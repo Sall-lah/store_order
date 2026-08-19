@@ -1,0 +1,511 @@
+openapi: 3.1.0
+info:
+  title: Store Order Microservice API
+  version: 1.0.0
+  description: |
+    High-performance Order Lifecycle and Payment Gateway Microservice.
+    Powered by Go (Chi router), PostgreSQL, Apache Kafka Transactional Outbox, and Midtrans Snap integration.
+
+    ### Authentication (Gateway Offloading)
+    Customer and Admin endpoints leverage API Gateway Offloading. The API Gateway (`store_gateway`) validates JWT tokens and injects verified upstream headers:
+    - `X-User-Id`: Identifier of the authenticated user (e.g. `usr_123`).
+    - `X-User-Email`: Email address of the authenticated user.
+    - `X-User-Role`: Required for admin operations (`admin`). Case-insensitive comparison.
+
+    ### Event-Driven Kafka Pipeline
+    Payment settlements, cancellations, expirations, and fulfillment transitions are emitted via a Transactional Outbox worker to Kafka topics:
+    - `order.created`
+    - `order.paid`
+    - `order.cancelled`
+    - `order.expired`
+    - `order.fulfilled`
+servers:
+  - url: http://localhost:8060
+    description: Local Order Service
+  - url: /
+    description: API Gateway Proxy
+
+paths:
+  /health:
+    get:
+      tags:
+        - Health
+      summary: Health Check Probe
+      description: Returns liveness status of the store_order microservice and connected database.
+      responses:
+        "200":
+          description: Service is healthy.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /api/v1/orders:
+    post:
+      tags:
+        - Customer Orders
+      summary: Create Order and Generate Snap Payment Token
+      description: Validates product item prices against the product service, creates atomic order records, and returns Midtrans Snap payment tokens.
+      security:
+        - GatewayUserIdAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CheckoutRequest"
+      responses:
+        "201":
+          description: Order created successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    get:
+      tags:
+        - Customer Orders
+      summary: List Authenticated Customer Orders
+      description: Retrieves paginated purchase history for the caller identified by X-User-Id.
+      security:
+        - GatewayUserIdAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: List of customer orders.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderListResponse"
+
+  /api/v1/orders/{id}:
+    get:
+      tags:
+        - Customer Orders
+      summary: Get Customer Order Details
+      description: Retrieves single order details including line items and payment state.
+      security:
+        - GatewayUserIdAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Order details.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/v1/orders/{id}/cancel:
+    post:
+      tags:
+        - Customer Orders
+      summary: Cancel Unpaid Order
+      description: Allows a customer to cancel an order currently in PENDING_PAYMENT status.
+      security:
+        - GatewayUserIdAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Order cancelled successfully.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /api/v1/orders/webhook/midtrans:
+    post:
+      tags:
+        - Payment Webhooks
+      summary: Midtrans Payment Callback Webhook
+      description: Receives asynchronous transaction notifications from Midtrans and verifies SHA512 signature.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MidtransWebhookPayload"
+      responses:
+        "200":
+          description: Webhook received and acknowledged.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/v1/admin/orders:
+    get:
+      tags:
+        - Admin Orders
+      summary: List All Orders Across Customers
+      description: Administrative query endpoint supporting multi-attribute filtering by status, search, and user ID.
+      security:
+        - GatewayAdminRoleAuth: []
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [PENDING_PAYMENT, PAID, PROCESSING, SHIPPED, COMPLETED, CANCELLED, EXPIRED]
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: userId
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 20
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+      responses:
+        "200":
+          description: Filtered order list.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderListResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/admin/orders/{id}/status:
+    patch:
+      tags:
+        - Admin Orders
+      summary: Update Order Fulfillment Status
+      description: Transitions order fulfillment state to PROCESSING, SHIPPED, or COMPLETED and queues outbox events.
+      security:
+        - GatewayAdminRoleAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - status
+              properties:
+                status:
+                  type: string
+                  enum: [PROCESSING, SHIPPED, COMPLETED, CANCELLED]
+      responses:
+        "200":
+          description: Order status updated.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrderResponse"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+
+  /api/v1/dev/orders/{id}/simulate-success:
+    post:
+      tags:
+        - Dev Simulation
+      summary: Simulate Successful Payment (DEV Mode)
+      description: Available only when DEV="TRUE". Transitions order to PAID and queues order.paid outbox event.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Simulated success response.
+
+  /api/v1/dev/orders/{id}/simulate-cancel:
+    post:
+      tags:
+        - Dev Simulation
+      summary: Simulate Order Cancellation (DEV Mode)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Simulated cancellation response.
+
+  /api/v1/dev/orders/{id}/simulate-expire:
+    post:
+      tags:
+        - Dev Simulation
+      summary: Simulate Order Expiration (DEV Mode)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Simulated expiration response.
+
+components:
+  securitySchemes:
+    GatewayUserIdAuth:
+      type: apiKey
+      in: header
+      name: X-User-Id
+      description: Injected by API Gateway for authenticated users
+    GatewayAdminRoleAuth:
+      type: apiKey
+      in: header
+      name: X-User-Role
+      description: Injected by API Gateway (must equal admin)
+
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          example: UP
+        service:
+          type: string
+          example: store_order
+        timestamp:
+          type: string
+          format: date-time
+        checks:
+          type: object
+
+    CheckoutItemRequest:
+      type: object
+      required:
+        - productId
+        - variantId
+        - quantity
+      properties:
+        productId:
+          type: string
+          format: uuid
+        variantId:
+          type: string
+          format: uuid
+        quantity:
+          type: integer
+          minimum: 1
+
+    CheckoutRequest:
+      type: object
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/CheckoutItemRequest"
+        shippingFee:
+          type: number
+          default: 0
+        shippingAddress:
+          type: string
+
+    OrderItemResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        productId:
+          type: string
+        variantId:
+          type: string
+        productName:
+          type: string
+        variantName:
+          type: string
+        sku:
+          type: string
+        price:
+          type: number
+        quantity:
+          type: integer
+        subtotal:
+          type: number
+
+    OrderResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        orderNumber:
+          type: string
+        userId:
+          type: string
+        userEmail:
+          type: string
+        status:
+          type: string
+        totalAmount:
+          type: number
+        shippingFee:
+          type: number
+        shippingAddress:
+          type: string
+        paymentType:
+          type: string
+        midtransTransactionId:
+          type: string
+        snapToken:
+          type: string
+        snapRedirectUrl:
+          type: string
+        paidAt:
+          type: string
+          format: date-time
+        expiresAt:
+          type: string
+          format: date-time
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderItemResponse"
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    OrderListResponse:
+      type: object
+      properties:
+        orders:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderResponse"
+        total:
+          type: integer
+        limit:
+          type: integer
+        offset:
+          type: integer
+
+    MidtransWebhookPayload:
+      type: object
+      required:
+        - order_id
+        - status_code
+        - gross_amount
+        - signature_key
+        - transaction_status
+      properties:
+        order_id:
+          type: string
+        status_code:
+          type: string
+        gross_amount:
+          type: string
+        signature_key:
+          type: string
+        transaction_status:
+          type: string
+        fraud_status:
+          type: string
+        payment_type:
+          type: string
+        transaction_id:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Invalid request parameters or validation error.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+    Unauthorized:
+      description: Missing authentication or invalid cryptographic signature.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+    Forbidden:
+      description: Caller lacks required permissions or does not own the resource.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string
+    NotFound:
+      description: The requested resource was not found.
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              error:
+                type: string
+              message:
+                type: string

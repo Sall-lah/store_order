@@ -1,0 +1,20 @@
+# Version control & internal tooling
+.git
+.gitignore
+.agent
+openspec
+
+# Local environment & secrets (Never bake secrets into images)
+.env
+*.local
+
+# Host-specific generated files & caches
+bin/
+internal/db/*_gen.go
+*.exe
+*.test
+*.out
+coverage.html
+
+# Documentation source files
+*.md
