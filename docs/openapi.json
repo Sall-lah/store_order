@@ -3,7 +3,7 @@
   "info": {
     "title": "Store Order Microservice API",
     "version": "1.0.0",
-    "description": "High-performance Order Lifecycle and Payment Gateway Microservice.\nPowered by Go (Chi router), PostgreSQL, Apache Kafka Transactional Outbox, and Midtrans Snap integration.\n"
+    "description": "High-performance Order Lifecycle, Payment Processing, and Event-Driven Microservice.\nPowered by Go (Chi router), PostgreSQL, Apache Kafka Transactional Outbox, Redis Sliding-Window Rate Limiting, and Midtrans Snap integration.\n\n### Authentication (Gateway Offloading)\nCustomer and Admin endpoints leverage API Gateway Offloading. The API Gateway (`store_gateway`) validates JWT tokens and injects verified upstream headers:\n- `X-User-Id`: Identifier of the authenticated user (e.g. `usr_123` or UUID).\n- `X-User-Email`: Email address of the authenticated user.\n- `X-User-Role`: Required for admin operations (`admin`). Case-insensitive comparison.\n\n### Event-Driven Kafka Pipeline\nPayment settlements, cancellations, expirations, and fulfillment transitions are emitted via a Transactional Outbox worker to Kafka topics:\n- `order.created`\n- `order.paid`\n- `order.cancelled`\n- `order.expired`\n- `order.fulfilled`\n\n### Rate Limiting & Resilience\nIngress traffic is safeguarded with Redis sliding-window counters:\n- Global IP rate limiting: 120 req/min\n- Webhook rate limiting: 300 req/min\n- Checkout rate limiting: 3 req/10s per User ID\n- Cancellation rate limiting: 5 req/min per User ID\n- Fail-Open policy: Allows traffic if Redis is unreachable or latency exceeds 25ms (`X-RateLimit-Degraded: true`).\n"
   },
   "servers": [
     {
@@ -20,6 +20,7 @@
       "get": {
         "tags": ["Health"],
         "summary": "Health Check Probe",
+        "description": "Returns liveness status of the store_order microservice and connected database.",
         "responses": {
           "200": {
             "description": "Service is healthy.",
@@ -38,6 +39,7 @@
       "post": {
         "tags": ["Customer Orders"],
         "summary": "Create Order and Generate Snap Payment Token",
+        "description": "Validates product item prices against the product service, creates atomic order records, and returns Midtrans Snap payment tokens.",
         "security": [{ "GatewayUserIdAuth": [] }],
         "requestBody": {
           "required": true,
@@ -59,13 +61,43 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         }
       },
       "get": {
         "tags": ["Customer Orders"],
         "summary": "List Authenticated Customer Orders",
+        "description": "Retrieves paginated purchase history for the caller identified by X-User-Id.",
         "security": [{ "GatewayUserIdAuth": [] }],
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "List of customer orders.",
@@ -76,6 +108,12 @@
                 }
               }
             }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         }
       }
@@ -84,13 +122,17 @@
       "get": {
         "tags": ["Customer Orders"],
         "summary": "Get Customer Order Details",
+        "description": "Retrieves single order details including line items and payment state.",
         "security": [{ "GatewayUserIdAuth": [] }],
         "parameters": [
           {
             "name": "id",
             "in": "path",
             "required": true,
-            "schema": { "type": "string", "format": "uuid" }
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ],
         "responses": {
@@ -103,6 +145,18 @@
                 }
               }
             }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         }
       }
@@ -111,13 +165,17 @@
       "post": {
         "tags": ["Customer Orders"],
         "summary": "Cancel Unpaid Order",
+        "description": "Allows a customer to cancel an order currently in PENDING_PAYMENT status.",
         "security": [{ "GatewayUserIdAuth": [] }],
         "parameters": [
           {
             "name": "id",
             "in": "path",
             "required": true,
-            "schema": { "type": "string", "format": "uuid" }
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ],
         "responses": {
@@ -130,6 +188,21 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         }
       }
@@ -138,6 +211,7 @@
       "post": {
         "tags": ["Payment Webhooks"],
         "summary": "Midtrans Payment Callback Webhook",
+        "description": "Receives asynchronous transaction notifications from Midtrans and verifies SHA-512 signature key.",
         "requestBody": {
           "required": true,
           "content": {
@@ -150,7 +224,27 @@
         },
         "responses": {
           "200": {
-            "description": "Webhook received and acknowledged."
+            "description": "Webhook received and processed successfully.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": { "type": "string", "example": "ok" },
+                    "message": { "type": "string", "example": "Webhook processed successfully" }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         }
       }
@@ -159,7 +253,61 @@
       "get": {
         "tags": ["Admin Orders"],
         "summary": "List All Orders Across Customers",
+        "description": "Administrative query endpoint supporting multi-attribute filtering by status, search, and user ID.",
         "security": [{ "GatewayAdminRoleAuth": [] }],
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "enum": [
+                "PENDING_PAYMENT",
+                "PAID",
+                "PROCESSING",
+                "SHIPPED",
+                "COMPLETED",
+                "CANCELLED",
+                "EXPIRED"
+              ]
+            }
+          },
+          {
+            "name": "search",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "userId",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 20
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "default": 0
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "Filtered order list.",
@@ -170,6 +318,15 @@
                 }
               }
             }
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         }
       }
@@ -178,15 +335,36 @@
       "patch": {
         "tags": ["Admin Orders"],
         "summary": "Update Order Fulfillment Status",
+        "description": "Transitions order fulfillment state to PROCESSING, SHIPPED, COMPLETED, or CANCELLED and queues outbox events.",
         "security": [{ "GatewayAdminRoleAuth": [] }],
         "parameters": [
           {
             "name": "id",
             "in": "path",
             "required": true,
-            "schema": { "type": "string", "format": "uuid" }
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["status"],
+                "properties": {
+                  "status": {
+                    "type": "string",
+                    "enum": ["PROCESSING", "SHIPPED", "COMPLETED", "CANCELLED"]
+                  }
+                }
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Order status updated.",
@@ -197,6 +375,21 @@
                 }
               }
             }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
           }
         }
       }
@@ -205,17 +398,34 @@
       "post": {
         "tags": ["Dev Simulation"],
         "summary": "Simulate Successful Payment (DEV Mode)",
+        "description": "Available only when DEV=\"TRUE\". Transitions order to PAID and queues order.paid outbox event.",
         "parameters": [
           {
             "name": "id",
             "in": "path",
             "required": true,
-            "schema": { "type": "string", "format": "uuid" }
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Simulated success response."
+            "description": "Simulated payment success response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevSimulateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
           }
         }
       }
@@ -224,17 +434,34 @@
       "post": {
         "tags": ["Dev Simulation"],
         "summary": "Simulate Order Cancellation (DEV Mode)",
+        "description": "Available only when DEV=\"TRUE\". Transitions order to CANCELLED and queues order.cancelled outbox event.",
         "parameters": [
           {
             "name": "id",
             "in": "path",
             "required": true,
-            "schema": { "type": "string", "format": "uuid" }
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Simulated cancellation response."
+            "description": "Simulated cancellation response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevSimulateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
           }
         }
       }
@@ -243,17 +470,34 @@
       "post": {
         "tags": ["Dev Simulation"],
         "summary": "Simulate Order Expiration (DEV Mode)",
+        "description": "Available only when DEV=\"TRUE\". Transitions order to EXPIRED and queues order.expired outbox event.",
         "parameters": [
           {
             "name": "id",
             "in": "path",
             "required": true,
-            "schema": { "type": "string", "format": "uuid" }
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Simulated expiration response."
+            "description": "Simulated expiration response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DevSimulateResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
           }
         }
       }
@@ -264,81 +508,188 @@
       "GatewayUserIdAuth": {
         "type": "apiKey",
         "in": "header",
-        "name": "X-User-Id"
+        "name": "X-User-Id",
+        "description": "Injected by API Gateway for authenticated users"
       },
       "GatewayAdminRoleAuth": {
         "type": "apiKey",
         "in": "header",
-        "name": "X-User-Role"
+        "name": "X-User-Role",
+        "description": "Injected by API Gateway (must equal admin)"
       }
     },
     "schemas": {
       "HealthResponse": {
         "type": "object",
         "properties": {
-          "status": { "type": "string" },
-          "service": { "type": "string" },
-          "timestamp": { "type": "string" }
+          "status": {
+            "type": "string",
+            "example": "UP"
+          },
+          "service": {
+            "type": "string",
+            "example": "store_order"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "checks": {
+            "type": "object",
+            "properties": {
+              "database": {
+                "type": "string",
+                "example": "UP"
+              }
+            }
+          }
         }
       },
       "CheckoutItemRequest": {
         "type": "object",
-        "required": ["productId", "variantId", "quantity"],
+        "required": [
+          "productId",
+          "variantId",
+          "quantity"
+        ],
         "properties": {
-          "productId": { "type": "string" },
-          "variantId": { "type": "string" },
-          "quantity": { "type": "integer" }
+          "productId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "variantId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "quantity": {
+            "type": "integer",
+            "minimum": 1
+          }
         }
       },
       "CheckoutRequest": {
         "type": "object",
-        "required": ["items"],
+        "required": [
+          "items"
+        ],
         "properties": {
           "items": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/CheckoutItemRequest" }
+            "items": {
+              "$ref": "#/components/schemas/CheckoutItemRequest"
+            }
           },
-          "shippingFee": { "type": "number" },
-          "shippingAddress": { "type": "string" }
+          "shippingFee": {
+            "type": "number",
+            "default": 0
+          },
+          "shippingAddress": {
+            "type": "string"
+          }
         }
       },
       "OrderItemResponse": {
         "type": "object",
         "properties": {
-          "id": { "type": "string" },
-          "productId": { "type": "string" },
-          "variantId": { "type": "string" },
-          "productName": { "type": "string" },
-          "variantName": { "type": "string" },
-          "sku": { "type": "string" },
-          "price": { "type": "number" },
-          "quantity": { "type": "integer" },
-          "subtotal": { "type": "number" }
+          "id": {
+            "type": "string"
+          },
+          "productId": {
+            "type": "string"
+          },
+          "variantId": {
+            "type": "string"
+          },
+          "productName": {
+            "type": "string"
+          },
+          "variantName": {
+            "type": "string"
+          },
+          "sku": {
+            "type": "string"
+          },
+          "price": {
+            "type": "number"
+          },
+          "quantity": {
+            "type": "integer"
+          },
+          "subtotal": {
+            "type": "number"
+          }
         }
       },
       "OrderResponse": {
         "type": "object",
         "properties": {
-          "id": { "type": "string" },
-          "orderNumber": { "type": "string" },
-          "userId": { "type": "string" },
-          "userEmail": { "type": "string" },
-          "status": { "type": "string" },
-          "totalAmount": { "type": "number" },
-          "shippingFee": { "type": "number" },
-          "shippingAddress": { "type": "string" },
-          "paymentType": { "type": "string" },
-          "midtransTransactionId": { "type": "string" },
-          "snapToken": { "type": "string" },
-          "snapRedirectUrl": { "type": "string" },
-          "paidAt": { "type": "string" },
-          "expiresAt": { "type": "string" },
+          "id": {
+            "type": "string"
+          },
+          "orderNumber": {
+            "type": "string"
+          },
+          "userId": {
+            "type": "string"
+          },
+          "userEmail": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "PENDING_PAYMENT",
+              "PAID",
+              "PROCESSING",
+              "SHIPPED",
+              "COMPLETED",
+              "CANCELLED",
+              "EXPIRED"
+            ]
+          },
+          "totalAmount": {
+            "type": "number"
+          },
+          "shippingFee": {
+            "type": "number"
+          },
+          "shippingAddress": {
+            "type": "string"
+          },
+          "paymentType": {
+            "type": "string"
+          },
+          "midtransTransactionId": {
+            "type": "string"
+          },
+          "snapToken": {
+            "type": "string"
+          },
+          "snapRedirectUrl": {
+            "type": "string"
+          },
+          "paidAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "date-time"
+          },
           "items": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/OrderItemResponse" }
+            "items": {
+              "$ref": "#/components/schemas/OrderItemResponse"
+            }
           },
-          "createdAt": { "type": "string" },
-          "updatedAt": { "type": "string" }
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
         }
       },
       "OrderListResponse": {
@@ -346,25 +697,191 @@
         "properties": {
           "orders": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/OrderResponse" }
+            "items": {
+              "$ref": "#/components/schemas/OrderResponse"
+            }
           },
-          "total": { "type": "integer" },
-          "limit": { "type": "integer" },
-          "offset": { "type": "integer" }
+          "total": {
+            "type": "integer"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "offset": {
+            "type": "integer"
+          }
         }
       },
       "MidtransWebhookPayload": {
         "type": "object",
-        "required": ["order_id", "status_code", "gross_amount", "signature_key", "transaction_status"],
+        "required": [
+          "order_id",
+          "status_code",
+          "gross_amount",
+          "signature_key",
+          "transaction_status"
+        ],
         "properties": {
-          "order_id": { "type": "string" },
-          "status_code": { "type": "string" },
-          "gross_amount": { "type": "string" },
-          "signature_key": { "type": "string" },
-          "transaction_status": { "type": "string" },
-          "fraud_status": { "type": "string" },
-          "payment_type": { "type": "string" },
-          "transaction_id": { "type": "string" }
+          "order_id": {
+            "type": "string"
+          },
+          "status_code": {
+            "type": "string"
+          },
+          "gross_amount": {
+            "type": "string"
+          },
+          "signature_key": {
+            "type": "string"
+          },
+          "transaction_status": {
+            "type": "string"
+          },
+          "fraud_status": {
+            "type": "string"
+          },
+          "payment_type": {
+            "type": "string"
+          },
+          "transaction_id": {
+            "type": "string"
+          }
+        }
+      },
+      "DevSimulateResponse": {
+        "type": "object",
+        "properties": {
+          "order_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid request parameters or validation error.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string",
+                  "example": "invalid_request"
+                },
+                "message": {
+                  "type": "string",
+                  "example": "Request validation failed"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing authentication or invalid cryptographic signature.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string",
+                  "example": "unauthorized"
+                },
+                "message": {
+                  "type": "string",
+                  "example": "Missing or invalid authentication credentials"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "Caller lacks required permissions or does not own the resource.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string",
+                  "example": "forbidden"
+                },
+                "message": {
+                  "type": "string",
+                  "example": "Admin privileges required"
+                }
+              }
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "The requested resource was not found.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string",
+                  "example": "not_found"
+                },
+                "message": {
+                  "type": "string",
+                  "example": "Order with specified ID not found"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "Rate limit exceeded. Too many requests in given time window.",
+        "headers": {
+          "Retry-After": {
+            "description": "Number of seconds to wait before making a new request.",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          "X-RateLimit-Limit": {
+            "description": "Number of allowed requests in the time window.",
+            "schema": {
+              "type": "integer"
+            }
+          },
+          "X-RateLimit-Remaining": {
+            "description": "Number of remaining requests in the current window.",
+            "schema": {
+              "type": "integer"
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "properties": {
+                "error": {
+                  "type": "string",
+                  "example": "rate_limit_exceeded"
+                },
+                "message": {
+                  "type": "string",
+                  "example": "Too many requests. Please retry after 7 seconds."
+                }
+              }
+            }
+          }
         }
       }
     }

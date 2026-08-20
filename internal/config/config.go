@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"strconv"
@@ -20,6 +21,9 @@ type Config struct {
 	MidtransServerKey    string
 	MidtransClientKey    string
 	MidtransIsProduction bool
+	RedisURL             string
+	RedisPassword        string
+	RedisRateLimitEnabled bool
 }
 
 // Load loads environment variables from .env if present and constructs a validated Config instance.
@@ -47,16 +51,29 @@ func Load() *Config {
 	midtransClientKey := getEnv("MIDTRANS_CLIENT_KEY", "")
 	midtransIsProd, _ := strconv.ParseBool(getEnv("MIDTRANS_IS_PRODUCTION", "false"))
 
+	redisHost := getEnv("REDIS_HOST", "")
+	redisPort := getEnv("REDIS_PORT", "6379")
+	redisURL := getEnv("REDIS_URL", "localhost:6379")
+	if redisHost != "" {
+		redisURL = fmt.Sprintf("%s:%s", redisHost, redisPort)
+	}
+	redisPassword := getEnv("REDIS_PASSWORD", "")
+	redisRateLimitEnabledStr := strings.ToLower(strings.TrimSpace(getEnv("REDIS_RATE_LIMIT_ENABLED", "true")))
+	redisRateLimitEnabled := redisRateLimitEnabledStr == "true" || redisRateLimitEnabledStr == "1"
+
 	return &Config{
-		Port:                 port,
-		Dev:                  dev,
-		EnableDocs:           enableDocs,
-		DatabaseURL:          databaseURL,
-		KafkaBrokers:         kafkaBrokers,
-		ProductServiceURL:    productServiceURL,
-		MidtransServerKey:    midtransServerKey,
-		MidtransClientKey:    midtransClientKey,
-		MidtransIsProduction: midtransIsProd,
+		Port:                  port,
+		Dev:                   dev,
+		EnableDocs:            enableDocs,
+		DatabaseURL:           databaseURL,
+		KafkaBrokers:          kafkaBrokers,
+		ProductServiceURL:     productServiceURL,
+		MidtransServerKey:     midtransServerKey,
+		MidtransClientKey:     midtransClientKey,
+		MidtransIsProduction:  midtransIsProd,
+		RedisURL:              redisURL,
+		RedisPassword:         redisPassword,
+		RedisRateLimitEnabled: redisRateLimitEnabled,
 	}
 }
 

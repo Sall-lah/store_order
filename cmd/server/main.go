@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,9 +19,11 @@ import (
 	"github.com/Sall-lah/store_order/internal/integration/product"
 	"github.com/Sall-lah/store_order/internal/kafka"
 	"github.com/Sall-lah/store_order/internal/outbox"
+	"github.com/Sall-lah/store_order/internal/ratelimit"
 	"github.com/Sall-lah/store_order/internal/repository"
 	"github.com/Sall-lah/store_order/internal/router"
 	"github.com/Sall-lah/store_order/internal/service"
+	"github.com/redis/go-redis/v9"
 )
 
 func main() {
@@ -75,7 +78,39 @@ func main() {
 	devHandler := handler.NewDevHandler(orderService)
 	healthHandler := handler.NewHealthHandler(prismaClient)
 
-	// 8. Build Router
+	// 8. Initialize Redis Rate Limiter
+	var rateLimiter ratelimit.Limiter
+	if cfg.RedisRateLimitEnabled {
+		var redisOpt *redis.Options
+		if strings.HasPrefix(cfg.RedisURL, "redis://") || strings.HasPrefix(cfg.RedisURL, "rediss://") {
+			if opt, err := redis.ParseURL(cfg.RedisURL); err == nil {
+				redisOpt = opt
+			}
+		}
+		if redisOpt == nil {
+			redisOpt = &redis.Options{
+				Addr:     cfg.RedisURL,
+				Password: cfg.RedisPassword,
+			}
+		}
+		redisClient := redis.NewClient(redisOpt)
+		pingCtx, pingCancel := context.WithTimeout(context.Background(), 2*time.Second)
+		if err := redisClient.Ping(pingCtx).Err(); err != nil {
+			log.Printf("[WARN] Redis connection warning (Addr: %s): %v. Rate limiter running in fail-open mode.", cfg.RedisURL, err)
+		} else {
+			log.Printf("[INFO] Connected successfully to Redis at %s", cfg.RedisURL)
+		}
+		pingCancel()
+
+		rateLimiter = ratelimit.NewRedisLimiter(redisClient, true, 25*time.Millisecond)
+		defer func() {
+			_ = rateLimiter.Close()
+		}()
+	} else {
+		log.Println("[INFO] Redis rate limiting is disabled via configuration.")
+	}
+
+	// 9. Build Router
 	r := router.SetupRouter(router.RouterDeps{
 		Config:         cfg,
 		OrderHandler:   orderHandler,
@@ -83,6 +118,7 @@ func main() {
 		AdminHandler:   adminHandler,
 		DevHandler:     devHandler,
 		HealthHandler:  healthHandler,
+		RateLimiter:    rateLimiter,
 	})
 
 	server := &http.Server{

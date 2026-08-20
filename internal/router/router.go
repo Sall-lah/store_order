@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	chiMiddleware "github.com/go-chi/chi/v5/middleware"
@@ -13,6 +14,7 @@ import (
 	"github.com/Sall-lah/store_order/internal/config"
 	"github.com/Sall-lah/store_order/internal/handler"
 	"github.com/Sall-lah/store_order/internal/middleware"
+	"github.com/Sall-lah/store_order/internal/ratelimit"
 )
 
 // RouterDeps holds handler dependencies required to configure the HTTP router.
@@ -23,6 +25,7 @@ type RouterDeps struct {
 	AdminHandler   *handler.AdminHandler
 	DevHandler     *handler.DevHandler
 	HealthHandler  *handler.HealthHandler
+	RateLimiter    ratelimit.Limiter
 }
 
 // SetupRouter initializes and configures the Chi HTTP multiplexer with routing rules and middleware.
@@ -36,12 +39,21 @@ func SetupRouter(deps RouterDeps) *chi.Mux {
 	r.Use(chiMiddleware.Logger)
 	r.Use(middleware.Recoverer)
 
+	// Global Volumetric IP Rate Limiting (120 req/min per client IP)
+	if deps.RateLimiter != nil {
+		r.Use(middleware.RequireRateLimit(deps.RateLimiter, middleware.RateLimitRule{
+			Limit:  120,
+			Window: time.Minute,
+			Keyer:  middleware.KeyByIP,
+		}))
+	}
+
 	// 2. CORS configuration (Permissive for gateway / local dev)
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token", "X-Request-ID", "X-User-Id", "X-User-Role", "X-User-Email"},
-		ExposedHeaders:   []string{"Link", "X-Request-ID"},
+		ExposedHeaders:   []string{"Link", "X-Request-ID", "X-RateLimit-Limit", "X-RateLimit-Remaining", "Retry-After"},
 		AllowCredentials: true,
 		MaxAge:           300,
 	}))
@@ -59,16 +71,45 @@ func SetupRouter(deps RouterDeps) *chi.Mux {
 
 	// 6. Public Webhook & Protected Customer Endpoints
 	r.Route("/api/v1/orders", func(r chi.Router) {
-		// Public Webhook from Midtrans
-		r.Post("/webhook/midtrans", deps.WebhookHandler.HandleMidtrans)
+		// Public Webhook from Midtrans (Scoped per source IP: 300 req/min)
+		webhookRouter := r
+		if deps.RateLimiter != nil {
+			webhookRouter = r.With(middleware.RequireRateLimit(deps.RateLimiter, middleware.RateLimitRule{
+				Limit:  300,
+				Window: time.Minute,
+				Keyer:  middleware.KeyWithPrefix("webhook", middleware.KeyByIP),
+			}))
+		}
+		webhookRouter.Post("/webhook/midtrans", deps.WebhookHandler.HandleMidtrans)
 
 		// Protected Customer Order Operations
 		r.Group(func(r chi.Router) {
 			r.Use(middleware.RequireAuth)
-			r.Post("/", deps.OrderHandler.Checkout)
+
+			// Checkout Rate Limiting: 3 requests per 10s per User ID
+			checkoutRouter := r
+			if deps.RateLimiter != nil {
+				checkoutRouter = r.With(middleware.RequireRateLimit(deps.RateLimiter, middleware.RateLimitRule{
+					Limit:  3,
+					Window: 10 * time.Second,
+					Keyer:  middleware.KeyWithPrefix("checkout", middleware.KeyByUser),
+				}))
+			}
+			checkoutRouter.Post("/", deps.OrderHandler.Checkout)
+
 			r.Get("/", deps.OrderHandler.ListOrders)
 			r.Get("/{id}", deps.OrderHandler.GetOrder)
-			r.Post("/{id}/cancel", deps.OrderHandler.CancelOrder)
+
+			// Cancellation Rate Limiting: 5 requests per minute per User ID
+			cancelRouter := r
+			if deps.RateLimiter != nil {
+				cancelRouter = r.With(middleware.RequireRateLimit(deps.RateLimiter, middleware.RateLimitRule{
+					Limit:  5,
+					Window: time.Minute,
+					Keyer:  middleware.KeyWithPrefix("cancel", middleware.KeyByUser),
+				}))
+			}
+			cancelRouter.Post("/{id}/cancel", deps.OrderHandler.CancelOrder)
 		})
 	})
 
