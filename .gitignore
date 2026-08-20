@@ -28,3 +28,4 @@ Thumbs.db
 # OpenSpec & Gemini
 .agent/
 openspec
+graphify-out
