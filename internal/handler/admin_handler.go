@@ -27,7 +27,9 @@ func NewAdminHandler(orderService service.OrderService) *AdminHandler {
 
 // UpdateStatusRequest payload for administrative status transitions.
 type UpdateStatusRequest struct {
-	Status string `json:"status"`
+	Status        string `json:"status"`
+	CourierName   string `json:"courierName,omitempty"`
+	ReceiptNumber string `json:"receiptNumber,omitempty"`
 }
 
 // ListOrders retrieves orders across all users with multi-attribute filtering.
@@ -63,7 +65,7 @@ func (h *AdminHandler) ListOrders(w http.ResponseWriter, r *http.Request) {
 }
 
 // UpdateOrderStatus transitions an order to a new fulfillment state.
-// Why: Enables administrators to mark orders as PROCESSING, SHIPPED, or COMPLETED.
+// Why: Enables administrators to mark orders as PROCESSING, SHIPPED, or COMPLETED, and attach logistics tracking metadata.
 func (h *AdminHandler) UpdateOrderStatus(w http.ResponseWriter, r *http.Request) {
 	orderID := chi.URLParam(r, "id")
 	if strings.TrimSpace(orderID) == "" {
@@ -84,7 +86,7 @@ func (h *AdminHandler) UpdateOrderStatus(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	orderResp, err := h.orderService.AdminUpdateStatus(r.Context(), orderID, req.Status)
+	orderResp, err := h.orderService.AdminUpdateStatus(r.Context(), orderID, req.Status, strings.TrimSpace(req.CourierName), strings.TrimSpace(req.ReceiptNumber))
 	if err != nil {
 		RespondError(w, http.StatusBadRequest, "update_failed", err.Error())
 		return

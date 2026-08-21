@@ -18,19 +18,45 @@ import (
 
 // Kafka event topics
 const (
+	TopicOrderEvents = "order.events"
+
+	// Legacy topic aliases retained for backwards compatibility
 	TopicOrderCreated   = "order.created"
 	TopicOrderPaid      = "order.paid"
 	TopicOrderCancelled = "order.cancelled"
 	TopicOrderExpired   = "order.expired"
 	TopicOrderFulfilled = "order.fulfilled"
+	TopicOrderShipped   = "order.shipped"
 )
 
-// DomainEventEnvelope wraps domain events with metadata for downstream consumer dispatch.
+// Domain event types
+const (
+	EventTypeOrderCreated   = "order.created"
+	EventTypeOrderPaid      = "order.paid"
+	EventTypeOrderShipped   = "order.fulfilled"
+	EventTypeOrderCancelled = "order.cancelled"
+	EventTypeOrderExpired   = "order.expired"
+)
+
+// DomainEventEnvelope wraps domain events with standardized metadata for downstream consumer dispatch.
 type DomainEventEnvelope struct {
-	EventID   string      `json:"eventId"`
-	EventType string      `json:"eventType"`
+	EventID   string      `json:"event_id"`
+	EventType string      `json:"event_type"`
 	Timestamp string      `json:"timestamp"`
+	Producer  string      `json:"producer"`
 	Data      interface{} `json:"data"`
+}
+
+// NewDomainEventEnvelope constructs an EventEnvelope with default producer and UTC timestamp.
+// Why: Standardizes event envelope serialization conforming to the platform notification specification.
+func NewDomainEventEnvelope(eventType string, data interface{}) DomainEventEnvelope {
+	return DomainEventEnvelope{
+		EventID:   uuid.NewString(),
+		EventType: eventType,
+		Timestamp: time.Now().UTC().Format(time.RFC3339),
+		Producer:  "store_order",
+		Data:      data,
+	}
 }
 
 // OrderItemResponse formats line item details for client responses.
@@ -60,6 +86,8 @@ type OrderResponse struct {
 	MidtransTransactionID string              `json:"midtransTransactionId,omitempty"`
 	SnapToken             string              `json:"snapToken,omitempty"`
 	SnapRedirectURL       string              `json:"snapRedirectUrl,omitempty"`
+	CourierName           string              `json:"courierName,omitempty"`
+	ReceiptNumber         string              `json:"receiptNumber,omitempty"`
 	PaidAt                *string             `json:"paidAt,omitempty"`
 	ExpiresAt             *string             `json:"expiresAt,omitempty"`
 	Items                 []OrderItemResponse `json:"items,omitempty"`
@@ -90,7 +118,7 @@ type OrderService interface {
 	CancelCustomerOrder(ctx context.Context, userID, orderID string) (*OrderResponse, error)
 	ProcessMidtransWebhook(ctx context.Context, notif midtrans.WebhookNotification) error
 	AdminListOrders(ctx context.Context, filter repository.OrderFilter) (*OrderListResponse, error)
-	AdminUpdateStatus(ctx context.Context, orderID string, newStatus string) (*OrderResponse, error)
+	AdminUpdateStatus(ctx context.Context, orderID string, newStatus string, courierName string, receiptNumber string) (*OrderResponse, error)
 	SimulatePaymentSuccess(ctx context.Context, orderID string) (*OrderResponse, error)
 	SimulateOrderCancel(ctx context.Context, orderID string) (*OrderResponse, error)
 	SimulateOrderExpire(ctx context.Context, orderID string) (*OrderResponse, error)
@@ -123,8 +151,8 @@ func NewOrderService(
 	}
 }
 
-// Checkout validates item prices, persists order + outbox records atomically, and acquires Midtrans Snap tokens.
-// Why: Provides a unified, atomic checkout transaction guaranteeing price integrity and payment readiness.
+// Checkout validates item prices, persists order + outbox records atomically, and acquires Midtrans Snap tokens upfront.
+// Why: Provides a unified, atomic checkout transaction guaranteeing price integrity, payment readiness, and complete event invoice payloads.
 func (s *Service) Checkout(ctx context.Context, userID, userEmail string, req CheckoutRequest) (*OrderResponse, error) {
 	if strings.TrimSpace(userID) == "" {
 		return nil, errors.New("authenticated user ID is required")
@@ -140,19 +168,9 @@ func (s *Service) Checkout(ctx context.Context, userID, userEmail string, req Ch
 	orderNumber := generateOrderNumber()
 	expiresAt := time.Now().Add(24 * time.Hour)
 
-	// 2. Prepare repo inputs
-	orderInput := repository.OrderCreateInput{
-		OrderNumber:     orderNumber,
-		UserID:          userID,
-		UserEmail:       userEmail,
-		TotalAmount:     totalAmount,
-		ShippingFee:     req.ShippingFee,
-		ShippingAddress: req.ShippingAddress,
-		ExpiresAt:       expiresAt,
-	}
-
 	var repoItems []repository.OrderItemInput
 	var snapItemDetails []midtrans.ItemDetail
+	var eventItems []map[string]interface{}
 
 	for _, vi := range validatedItems {
 		repoItems = append(repoItems, repository.OrderItemInput{
@@ -172,6 +190,24 @@ func (s *Service) Checkout(ctx context.Context, userID, userEmail string, req Ch
 			Quantity: vi.Quantity,
 			Name:     vi.ProductName,
 		})
+
+		itemMap := map[string]interface{}{
+			"id":          vi.ProductID,
+			"productId":   vi.ProductID,
+			"product_id":  vi.ProductID,
+			"variantId":   vi.VariantID,
+			"variant_id":  vi.VariantID,
+			"productName": vi.ProductName,
+			"sku":         vi.SKU,
+			"price":       vi.UnitPrice,
+			"quantity":    vi.Quantity,
+			"subtotal":    vi.Subtotal,
+		}
+		if vi.VariantName != "" {
+			itemMap["variantName"] = vi.VariantName
+			itemMap["variant_name"] = vi.VariantName
+		}
+		eventItems = append(eventItems, itemMap)
 	}
 
 	if req.ShippingFee > 0 {
@@ -183,36 +219,8 @@ func (s *Service) Checkout(ctx context.Context, userID, userEmail string, req Ch
 		})
 	}
 
-	// 3. Prepare initial order.created outbox event payload
-	eventPayloadBytes, _ := json.Marshal(DomainEventEnvelope{
-		EventID:   uuid.NewString(),
-		EventType: TopicOrderCreated,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Data: map[string]interface{}{
-			"orderNumber": orderNumber,
-			"userId":      userID,
-			"userEmail":   userEmail,
-			"totalAmount": totalAmount,
-			"expiresAt":   expiresAt.Format(time.RFC3339),
-			"items":       validatedItems,
-		},
-	})
-
-	outboxInput := &repository.OutboxCreateInput{
-		AggregateType: "ORDER",
-		Topic:         TopicOrderCreated,
-		Payload:       string(eventPayloadBytes),
-	}
-
-	// 4. Atomically persist order, line items, and outbox event
-	createdOrder, err := s.orderRepo.CreateOrderWithItemsAndOutbox(ctx, orderInput, repoItems, outboxInput)
-	if err != nil {
-		return nil, fmt.Errorf("failed to save order: %w", err)
-	}
-
-	orderResp := ToOrderResponse(createdOrder)
-
-	// 5. Generate Midtrans Snap Token
+	// 2. Acquire Midtrans Snap token upfront
+	var snapToken, snapRedirectURL string
 	snapReq := midtrans.SnapTransactionRequest{
 		TransactionDetails: midtrans.TransactionDetails{
 			OrderID:     orderNumber,
@@ -226,15 +234,65 @@ func (s *Service) Checkout(ctx context.Context, userID, userEmail string, req Ch
 	}
 
 	snapResp, err := s.midtransClient.CreateSnapTransaction(ctx, snapReq)
-	if err != nil {
-		return orderResp, nil
+	if err == nil && snapResp != nil {
+		snapToken = snapResp.Token
+		snapRedirectURL = snapResp.RedirectURL
 	}
 
-	_ = s.orderRepo.UpdateSnapToken(ctx, createdOrder.ID, snapResp.Token, snapResp.RedirectURL)
-	orderResp.SnapToken = snapResp.Token
-	orderResp.SnapRedirectURL = snapResp.RedirectURL
+	// 3. Prepare repo order input with Snap token
+	orderInput := repository.OrderCreateInput{
+		OrderNumber:     orderNumber,
+		UserID:          userID,
+		UserEmail:       userEmail,
+		TotalAmount:     totalAmount,
+		ShippingFee:     req.ShippingFee,
+		ShippingAddress: req.ShippingAddress,
+		SnapToken:       snapToken,
+		SnapRedirectURL: snapRedirectURL,
+		ExpiresAt:       expiresAt,
+	}
 
-	return orderResp, nil
+	// 4. Prepare initial order.created outbox event payload with active Snap payment redirect URL
+	eventData := map[string]interface{}{
+		"id":                orderNumber,
+		"order_id":          orderNumber,
+		"orderNumber":       orderNumber,
+		"order_number":      orderNumber,
+		"userId":            userID,
+		"user_id":           userID,
+		"userEmail":         userEmail,
+		"user_email":        userEmail,
+		"status":            string(db.OrderStatusPendingPayment),
+		"totalAmount":       totalAmount,
+		"total_amount":      totalAmount,
+		"shippingFee":       req.ShippingFee,
+		"shipping_fee":      req.ShippingFee,
+		"shippingAddress":   req.ShippingAddress,
+		"shipping_address":  req.ShippingAddress,
+		"snapRedirectUrl":   snapRedirectURL,
+		"snap_redirect_url": snapRedirectURL,
+		"createdAt":         time.Now().UTC().Format(time.RFC3339),
+		"created_at":        time.Now().UTC().Format(time.RFC3339),
+		"expiresAt":         expiresAt.UTC().Format(time.RFC3339),
+		"expires_at":        expiresAt.UTC().Format(time.RFC3339),
+		"items":             eventItems,
+	}
+
+	eventPayloadBytes, _ := json.Marshal(NewDomainEventEnvelope(EventTypeOrderCreated, eventData))
+
+	outboxInput := &repository.OutboxCreateInput{
+		AggregateType: "ORDER",
+		Topic:         TopicOrderEvents,
+		Payload:       string(eventPayloadBytes),
+	}
+
+	// 5. Atomically persist order, line items, and outbox event
+	createdOrder, err := s.orderRepo.CreateOrderWithItemsAndOutbox(ctx, orderInput, repoItems, outboxInput)
+	if err != nil {
+		return nil, fmt.Errorf("failed to save order: %w", err)
+	}
+
+	return ToOrderResponse(createdOrder), nil
 }
 
 // GetCustomerOrder retrieves a specific order after validating ownership.
@@ -289,26 +347,17 @@ func (s *Service) CancelCustomerOrder(ctx context.Context, userID, orderID strin
 		return nil, fmt.Errorf("cannot cancel order in %s status", order.Status)
 	}
 
-	eventPayload, _ := json.Marshal(DomainEventEnvelope{
-		EventID:   uuid.NewString(),
-		EventType: TopicOrderCancelled,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Data: map[string]interface{}{
-			"orderId":     order.ID,
-			"orderNumber": order.OrderNumber,
-			"userId":      order.UserID,
-			"reason":      "Customer cancelled",
-		},
-	})
+	order.Status = db.OrderStatusCancelled
+	eventPayload, _ := json.Marshal(NewDomainEventEnvelope(EventTypeOrderCancelled, buildOrderEventData(order, "Customer cancelled")))
 
 	outbox := &repository.OutboxCreateInput{
 		AggregateType: "ORDER",
 		AggregateID:   order.ID,
-		Topic:         TopicOrderCancelled,
+		Topic:         TopicOrderEvents,
 		Payload:       string(eventPayload),
 	}
 
-	updated, err := s.orderRepo.UpdateOrderStatusWithOutbox(ctx, orderID, db.OrderStatusCancelled, nil, outbox)
+	updated, err := s.orderRepo.UpdateOrderStatusWithOutbox(ctx, orderID, db.OrderStatusCancelled, nil, nil, outbox)
 	if err != nil {
 		return nil, err
 	}
@@ -339,16 +388,17 @@ func (s *Service) ProcessMidtransWebhook(ctx context.Context, notif midtrans.Web
 		return nil
 	}
 
-	var topic string
+	var eventType string
+	var reason string
 	switch targetStatus {
 	case db.OrderStatusPaid:
-		topic = TopicOrderPaid
+		eventType = EventTypeOrderPaid
 	case db.OrderStatusCancelled:
-		topic = TopicOrderCancelled
+		eventType = EventTypeOrderCancelled
+		reason = "Midtrans transaction cancelled or denied"
 	case db.OrderStatusExpired:
-		topic = TopicOrderExpired
-	default:
-		topic = ""
+		eventType = EventTypeOrderExpired
+		reason = "Payment expired"
 	}
 
 	now := time.Now()
@@ -359,30 +409,25 @@ func (s *Service) ProcessMidtransWebhook(ctx context.Context, notif midtrans.Web
 	}
 
 	var outbox *repository.OutboxCreateInput
-	if topic != "" {
-		eventPayload, _ := json.Marshal(DomainEventEnvelope{
-			EventID:   uuid.NewString(),
-			EventType: topic,
-			Timestamp: now.UTC().Format(time.RFC3339),
-			Data: map[string]interface{}{
-				"orderId":               order.ID,
-				"orderNumber":           order.OrderNumber,
-				"userId":                order.UserID,
-				"userEmail":             order.UserEmail,
-				"totalAmount":           order.TotalAmount,
-				"paymentType":           notif.PaymentType,
-				"midtransTransactionId": notif.TransactionID,
-			},
-		})
+	if eventType != "" {
+		order.Status = targetStatus
+		eventData := buildOrderEventData(order, reason)
+		eventData["paymentType"] = notif.PaymentType
+		eventData["midtransTransactionId"] = notif.TransactionID
+		if targetStatus == db.OrderStatusPaid {
+			eventData["paidAt"] = now.UTC().Format(time.RFC3339)
+		}
+
+		eventPayload, _ := json.Marshal(NewDomainEventEnvelope(eventType, eventData))
 		outbox = &repository.OutboxCreateInput{
 			AggregateType: "ORDER",
 			AggregateID:   order.ID,
-			Topic:         topic,
+			Topic:         TopicOrderEvents,
 			Payload:       string(eventPayload),
 		}
 	}
 
-	_, err = s.orderRepo.UpdateOrderStatusWithOutbox(ctx, order.ID, targetStatus, meta, outbox)
+	_, err = s.orderRepo.UpdateOrderStatusWithOutbox(ctx, order.ID, targetStatus, meta, nil, outbox)
 	return err
 }
 
@@ -408,48 +453,62 @@ func (s *Service) AdminListOrders(ctx context.Context, filter repository.OrderFi
 }
 
 // AdminUpdateStatus transitions fulfillment state (e.g. PROCESSING, SHIPPED, COMPLETED).
-// Why: Allows store administrators to update fulfillment workflow and dispatch downstream notifications.
-func (s *Service) AdminUpdateStatus(ctx context.Context, orderID string, newStatusStr string) (*OrderResponse, error) {
+// Why: Allows store administrators to update fulfillment workflow, record logistics tracking, and dispatch downstream notifications.
+func (s *Service) AdminUpdateStatus(ctx context.Context, orderID string, newStatusStr string, courierName string, receiptNumber string) (*OrderResponse, error) {
 	order, err := s.orderRepo.GetOrderByID(ctx, orderID)
 	if err != nil || order == nil {
 		return nil, errors.New("order not found")
 	}
 
 	var targetStatus db.OrderStatus
+	var eventType string
 	switch strings.ToUpper(strings.TrimSpace(newStatusStr)) {
 	case "PROCESSING":
 		targetStatus = db.OrderStatusProcessing
 	case "SHIPPED":
 		targetStatus = db.OrderStatusShipped
+		eventType = EventTypeOrderShipped
 	case "COMPLETED":
 		targetStatus = db.OrderStatusCompleted
 	case "CANCELLED":
 		targetStatus = db.OrderStatusCancelled
+		eventType = EventTypeOrderCancelled
 	default:
 		return nil, fmt.Errorf("invalid target order status: %s", newStatusStr)
 	}
 
+	var shipping *repository.ShippingMetadata
+	if courierName != "" || receiptNumber != "" {
+		shipping = &repository.ShippingMetadata{
+			CourierName:   courierName,
+			ReceiptNumber: receiptNumber,
+		}
+	}
+
 	var outbox *repository.OutboxCreateInput
-	if targetStatus == db.OrderStatusShipped || targetStatus == db.OrderStatusCompleted {
-		eventPayload, _ := json.Marshal(DomainEventEnvelope{
-			EventID:   uuid.NewString(),
-			EventType: TopicOrderFulfilled,
-			Timestamp: time.Now().UTC().Format(time.RFC3339),
-			Data: map[string]interface{}{
-				"orderId":     order.ID,
-				"orderNumber": order.OrderNumber,
-				"status":      string(targetStatus),
-			},
-		})
+	if eventType != "" {
+		order.Status = targetStatus
+		eventData := buildOrderEventData(order, "")
+		if courierName != "" {
+			eventData["courierName"] = courierName
+		}
+		if receiptNumber != "" {
+			eventData["receiptNumber"] = receiptNumber
+		}
+		if targetStatus == db.OrderStatusCancelled {
+			eventData["reason"] = "Admin cancelled"
+		}
+
+		eventPayload, _ := json.Marshal(NewDomainEventEnvelope(eventType, eventData))
 		outbox = &repository.OutboxCreateInput{
 			AggregateType: "ORDER",
 			AggregateID:   order.ID,
-			Topic:         TopicOrderFulfilled,
+			Topic:         TopicOrderEvents,
 			Payload:       string(eventPayload),
 		}
 	}
 
-	updated, err := s.orderRepo.UpdateOrderStatusWithOutbox(ctx, orderID, targetStatus, nil, outbox)
+	updated, err := s.orderRepo.UpdateOrderStatusWithOutbox(ctx, orderID, targetStatus, nil, shipping, outbox)
 	if err != nil {
 		return nil, err
 	}
@@ -472,29 +531,21 @@ func (s *Service) SimulatePaymentSuccess(ctx context.Context, orderID string) (*
 		PaidAt:                &now,
 	}
 
-	eventPayload, _ := json.Marshal(DomainEventEnvelope{
-		EventID:   uuid.NewString(),
-		EventType: TopicOrderPaid,
-		Timestamp: now.UTC().Format(time.RFC3339),
-		Data: map[string]interface{}{
-			"orderId":               order.ID,
-			"orderNumber":           order.OrderNumber,
-			"userId":                order.UserID,
-			"userEmail":             order.UserEmail,
-			"totalAmount":           order.TotalAmount,
-			"paymentType":           meta.PaymentType,
-			"midtransTransactionId": meta.MidtransTransactionID,
-		},
-	})
+	order.Status = db.OrderStatusPaid
+	eventData := buildOrderEventData(order, "")
+	eventData["paymentType"] = meta.PaymentType
+	eventData["midtransTransactionId"] = meta.MidtransTransactionID
+	eventData["paidAt"] = now.UTC().Format(time.RFC3339)
 
+	eventPayload, _ := json.Marshal(NewDomainEventEnvelope(EventTypeOrderPaid, eventData))
 	outbox := &repository.OutboxCreateInput{
 		AggregateType: "ORDER",
 		AggregateID:   order.ID,
-		Topic:         TopicOrderPaid,
+		Topic:         TopicOrderEvents,
 		Payload:       string(eventPayload),
 	}
 
-	updated, err := s.orderRepo.UpdateOrderStatusWithOutbox(ctx, orderID, db.OrderStatusPaid, meta, outbox)
+	updated, err := s.orderRepo.UpdateOrderStatusWithOutbox(ctx, orderID, db.OrderStatusPaid, meta, nil, outbox)
 	if err != nil {
 		return nil, err
 	}
@@ -516,30 +567,96 @@ func (s *Service) SimulateOrderExpire(ctx context.Context, orderID string) (*Ord
 		return nil, errors.New("order not found")
 	}
 
-	eventPayload, _ := json.Marshal(DomainEventEnvelope{
-		EventID:   uuid.NewString(),
-		EventType: TopicOrderExpired,
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Data: map[string]interface{}{
-			"orderId":     order.ID,
-			"orderNumber": order.OrderNumber,
-			"userId":      order.UserID,
-		},
-	})
+	order.Status = db.OrderStatusExpired
+	eventPayload, _ := json.Marshal(NewDomainEventEnvelope(EventTypeOrderExpired, buildOrderEventData(order, "Dev simulation expired")))
 
 	outbox := &repository.OutboxCreateInput{
 		AggregateType: "ORDER",
 		AggregateID:   order.ID,
-		Topic:         TopicOrderExpired,
+		Topic:         TopicOrderEvents,
 		Payload:       string(eventPayload),
 	}
 
-	updated, err := s.orderRepo.UpdateOrderStatusWithOutbox(ctx, orderID, db.OrderStatusExpired, nil, outbox)
+	updated, err := s.orderRepo.UpdateOrderStatusWithOutbox(ctx, orderID, db.OrderStatusExpired, nil, nil, outbox)
 	if err != nil {
 		return nil, err
 	}
 
 	return ToOrderResponse(updated), nil
+}
+
+// buildOrderEventData extracts full order metadata and line items into standard OrderEventData schema.
+// Why: Provides a single source of truth for constructing domain notification payloads across all lifecycle events conforming to the store_notification OpenAPI contract.
+func buildOrderEventData(order *db.OrderModel, reason string) map[string]interface{} {
+	if order == nil {
+		return map[string]interface{}{}
+	}
+
+	items := make([]map[string]interface{}, 0)
+	if order.RelationsOrder.Items != nil {
+		for _, item := range order.RelationsOrder.Items {
+			itemMap := map[string]interface{}{
+				"id":          item.ID,
+				"productId":   item.ProductID,
+				"product_id":  item.ProductID,
+				"variantId":   item.VariantID,
+				"variant_id":  item.VariantID,
+				"productName": item.ProductName,
+				"sku":         item.Sku,
+				"price":       item.Price,
+				"quantity":    item.Quantity,
+				"subtotal":    item.Subtotal,
+			}
+			if vName, ok := item.VariantName(); ok && vName != "" {
+				itemMap["variantName"] = vName
+				itemMap["variant_name"] = vName
+			}
+			items = append(items, itemMap)
+		}
+	}
+
+	data := map[string]interface{}{
+		"id":           order.ID,
+		"order_id":     order.ID,
+		"orderNumber":  order.OrderNumber,
+		"order_number": order.OrderNumber,
+		"userId":       order.UserID,
+		"user_id":      order.UserID,
+		"userEmail":    order.UserEmail,
+		"user_email":   order.UserEmail,
+		"status":       string(order.Status),
+		"totalAmount":  order.TotalAmount,
+		"total_amount": order.TotalAmount,
+		"shippingFee":  order.ShippingFee,
+		"shipping_fee": order.ShippingFee,
+		"createdAt":    order.CreatedAt.UTC().Format(time.RFC3339),
+		"created_at":   order.CreatedAt.UTC().Format(time.RFC3339),
+		"items":        items,
+	}
+
+	if addr, ok := order.ShippingAddress(); ok && addr != "" {
+		data["shippingAddress"] = addr
+	}
+	if pType, ok := order.PaymentType(); ok && pType != "" {
+		data["paymentType"] = pType
+	}
+	if snapURL, ok := order.SnapRedirectURL(); ok && snapURL != "" {
+		data["snapRedirectUrl"] = snapURL
+	}
+	if cName, ok := order.CourierName(); ok && cName != "" {
+		data["courierName"] = cName
+	}
+	if rNum, ok := order.ReceiptNumber(); ok && rNum != "" {
+		data["receiptNumber"] = rNum
+	}
+	if paidAt, ok := order.PaidAt(); ok {
+		data["paidAt"] = paidAt.UTC().Format(time.RFC3339)
+	}
+	if reason != "" {
+		data["reason"] = reason
+	}
+
+	return data
 }
 
 // ToOrderResponse maps a database OrderModel to a client DTO.
@@ -550,15 +667,15 @@ func ToOrderResponse(m *db.OrderModel) *OrderResponse {
 	}
 
 	resp := &OrderResponse{
-		ID:              m.ID,
-		OrderNumber:     m.OrderNumber,
-		UserID:          m.UserID,
-		UserEmail:       m.UserEmail,
-		Status:          string(m.Status),
-		TotalAmount:     m.TotalAmount,
-		ShippingFee:     m.ShippingFee,
-		CreatedAt:       m.CreatedAt.Format(time.RFC3339),
-		UpdatedAt:       m.UpdatedAt.Format(time.RFC3339),
+		ID:          m.ID,
+		OrderNumber: m.OrderNumber,
+		UserID:      m.UserID,
+		UserEmail:   m.UserEmail,
+		Status:      string(m.Status),
+		TotalAmount: m.TotalAmount,
+		ShippingFee: m.ShippingFee,
+		CreatedAt:   m.CreatedAt.Format(time.RFC3339),
+		UpdatedAt:   m.UpdatedAt.Format(time.RFC3339),
 	}
 
 	if addr, ok := m.ShippingAddress(); ok {
@@ -575,6 +692,12 @@ func ToOrderResponse(m *db.OrderModel) *OrderResponse {
 	}
 	if url, ok := m.SnapRedirectURL(); ok {
 		resp.SnapRedirectURL = url
+	}
+	if cName, ok := m.CourierName(); ok {
+		resp.CourierName = cName
+	}
+	if rNum, ok := m.ReceiptNumber(); ok {
+		resp.ReceiptNumber = rNum
 	}
 	if paidAt, ok := m.PaidAt(); ok {
 		str := paidAt.Format(time.RFC3339)

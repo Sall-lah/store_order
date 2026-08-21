@@ -284,6 +284,12 @@ paths:
                 status:
                   type: string
                   enum: [PROCESSING, SHIPPED, COMPLETED, CANCELLED]
+                courierName:
+                  type: string
+                  example: JNE Express
+                receiptNumber:
+                  type: string
+                  example: JNE-88219038
       responses:
         "200":
           description: Order status updated.
@@ -492,6 +498,12 @@ components:
           type: string
         snapRedirectUrl:
           type: string
+        courierName:
+          type: string
+          example: JNE Express
+        receiptNumber:
+          type: string
+          example: JNE-88219038
         paidAt:
           type: string
           format: date-time
@@ -558,6 +570,79 @@ components:
           type: string
         message:
           type: string
+
+    KafkaEventEnvelope:
+      type: object
+      required:
+        - event_id
+        - event_type
+        - timestamp
+        - producer
+        - data
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        event_type:
+          type: string
+          enum:
+            - order.created
+            - order.paid
+            - order.cancelled
+            - order.expired
+            - order.fulfilled
+        timestamp:
+          type: string
+          format: date-time
+        producer:
+          type: string
+          example: store_order
+        data:
+          $ref: "#/components/schemas/OrderEventData"
+
+    OrderEventData:
+      type: object
+      required:
+        - orderNumber
+        - userEmail
+        - totalAmount
+      properties:
+        id:
+          type: string
+          format: uuid
+        orderNumber:
+          type: string
+        userId:
+          type: string
+        userEmail:
+          type: string
+          format: email
+        status:
+          type: string
+        totalAmount:
+          type: number
+        shippingFee:
+          type: number
+        shippingAddress:
+          type: string
+        paymentType:
+          type: string
+        snapRedirectUrl:
+          type: string
+          format: uri
+        paidAt:
+          type: string
+          format: date-time
+        createdAt:
+          type: string
+          format: date-time
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/OrderItemResponse"
+        reason:
+          type: string
+          example: Payment expired
 
   responses:
     BadRequest:

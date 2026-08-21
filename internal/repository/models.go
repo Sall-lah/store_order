@@ -26,6 +26,10 @@ type OrderCreateInput struct {
 	TotalAmount     float64
 	ShippingFee     float64
 	ShippingAddress string
+	SnapToken       string
+	SnapRedirectURL string
+	CourierName     string
+	ReceiptNumber   string
 	ExpiresAt       time.Time
 }
 
@@ -42,6 +46,12 @@ type PaymentMetadata struct {
 	PaymentType           string
 	MidtransTransactionID string
 	PaidAt                *time.Time
+}
+
+// ShippingMetadata contains logistics shipment tracking attributes provided by administrators.
+type ShippingMetadata struct {
+	CourierName   string
+	ReceiptNumber string
 }
 
 // OrderFilter options for querying orders.

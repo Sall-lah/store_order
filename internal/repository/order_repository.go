@@ -14,7 +14,7 @@ type OrderRepository interface {
 	GetOrderByOrderNumber(ctx context.Context, orderNumber string) (*db.OrderModel, error)
 	ListOrdersByUserID(ctx context.Context, userID string, limit, offset int) ([]db.OrderModel, int, error)
 	ListAllOrders(ctx context.Context, filter OrderFilter) ([]db.OrderModel, int, error)
-	UpdateOrderStatusWithOutbox(ctx context.Context, orderID string, newStatus db.OrderStatus, meta *PaymentMetadata, outbox *OutboxCreateInput) (*db.OrderModel, error)
+	UpdateOrderStatusWithOutbox(ctx context.Context, orderID string, newStatus db.OrderStatus, meta *PaymentMetadata, shipping *ShippingMetadata, outbox *OutboxCreateInput) (*db.OrderModel, error)
 	UpdateSnapToken(ctx context.Context, orderID, snapToken, snapRedirectURL string) error
 }
 
@@ -37,15 +37,36 @@ func (r *SQLOrderRepository) CreateOrderWithItemsAndOutbox(
 	items []OrderItemInput,
 	outbox *OutboxCreateInput,
 ) (*db.OrderModel, error) {
-	// 1. Create order record
+	// 1. Create order record with optional Snap payment and shipping metadata
+	var optionalParams []db.OrderSetParam
+	if orderInput.ShippingFee > 0 {
+		optionalParams = append(optionalParams, db.Order.ShippingFee.Set(orderInput.ShippingFee))
+	}
+	if orderInput.ShippingAddress != "" {
+		optionalParams = append(optionalParams, db.Order.ShippingAddress.Set(orderInput.ShippingAddress))
+	}
+	if !orderInput.ExpiresAt.IsZero() {
+		optionalParams = append(optionalParams, db.Order.ExpiresAt.Set(orderInput.ExpiresAt))
+	}
+	if orderInput.SnapToken != "" {
+		optionalParams = append(optionalParams, db.Order.SnapToken.Set(orderInput.SnapToken))
+	}
+	if orderInput.SnapRedirectURL != "" {
+		optionalParams = append(optionalParams, db.Order.SnapRedirectURL.Set(orderInput.SnapRedirectURL))
+	}
+	if orderInput.CourierName != "" {
+		optionalParams = append(optionalParams, db.Order.CourierName.Set(orderInput.CourierName))
+	}
+	if orderInput.ReceiptNumber != "" {
+		optionalParams = append(optionalParams, db.Order.ReceiptNumber.Set(orderInput.ReceiptNumber))
+	}
+
 	createdOrder, err := r.client.Order.CreateOne(
 		db.Order.OrderNumber.Set(orderInput.OrderNumber),
 		db.Order.UserID.Set(orderInput.UserID),
 		db.Order.UserEmail.Set(orderInput.UserEmail),
 		db.Order.TotalAmount.Set(orderInput.TotalAmount),
-		db.Order.ShippingFee.Set(orderInput.ShippingFee),
-		db.Order.ShippingAddress.Set(orderInput.ShippingAddress),
-		db.Order.ExpiresAt.Set(orderInput.ExpiresAt),
+		optionalParams...,
 	).Exec(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to insert order: %w", err)
@@ -193,6 +214,7 @@ func (r *SQLOrderRepository) UpdateOrderStatusWithOutbox(
 	orderID string,
 	newStatus db.OrderStatus,
 	meta *PaymentMetadata,
+	shipping *ShippingMetadata,
 	outbox *OutboxCreateInput,
 ) (*db.OrderModel, error) {
 	var updateParams []db.OrderSetParam
@@ -207,6 +229,15 @@ func (r *SQLOrderRepository) UpdateOrderStatusWithOutbox(
 		}
 		if meta.PaidAt != nil {
 			updateParams = append(updateParams, db.Order.PaidAt.Set(*meta.PaidAt))
+		}
+	}
+
+	if shipping != nil {
+		if shipping.CourierName != "" {
+			updateParams = append(updateParams, db.Order.CourierName.Set(shipping.CourierName))
+		}
+		if shipping.ReceiptNumber != "" {
+			updateParams = append(updateParams, db.Order.ReceiptNumber.Set(shipping.ReceiptNumber))
 		}
 	}
 

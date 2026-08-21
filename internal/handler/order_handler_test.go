@@ -82,6 +82,7 @@ func (m *MockServiceOrderRepo) UpdateOrderStatusWithOutbox(
 	orderID string,
 	newStatus db.OrderStatus,
 	meta *repository.PaymentMetadata,
+	shipping *repository.ShippingMetadata,
 	outbox *repository.OutboxCreateInput,
 ) (*db.OrderModel, error) {
 	if o, ok := m.orders[orderID]; ok {

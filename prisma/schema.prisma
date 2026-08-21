@@ -116,6 +116,8 @@ model Order {
   midtransTransactionId String?
   snapToken             String?
   snapRedirectUrl       String?
+  courierName           String?
+  receiptNumber         String?
   paidAt                DateTime?
   expiresAt             DateTime?
   items                 OrderItem[]
