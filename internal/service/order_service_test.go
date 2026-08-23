@@ -104,6 +104,22 @@ func (m *MockOrderRepository) ListOrdersByUserID(ctx context.Context, userID str
 	return list, len(list), nil
 }
 
+func (m *MockOrderRepository) ListActiveOrdersByUserID(ctx context.Context, userID string) ([]db.OrderModel, error) {
+	var list []db.OrderModel
+	activeStatuses := map[db.OrderStatus]bool{
+		db.OrderStatusPendingPayment: true,
+		db.OrderStatusPaid:           true,
+		db.OrderStatusProcessing:     true,
+		db.OrderStatusShipped:        true,
+	}
+	for _, o := range m.orders {
+		if o.UserID == userID && activeStatuses[o.Status] {
+			list = append(list, *o)
+		}
+	}
+	return list, nil
+}
+
 func (m *MockOrderRepository) ListAllOrders(ctx context.Context, filter repository.OrderFilter) ([]db.OrderModel, int, error) {
 	var list []db.OrderModel
 	for _, o := range m.orders {

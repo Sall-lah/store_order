@@ -14,6 +14,7 @@ import (
 
 	"github.com/Sall-lah/store_order/internal/config"
 	"github.com/Sall-lah/store_order/internal/db"
+	appgrpc "github.com/Sall-lah/store_order/internal/grpc"
 	"github.com/Sall-lah/store_order/internal/handler"
 	"github.com/Sall-lah/store_order/internal/integration/midtrans"
 	"github.com/Sall-lah/store_order/internal/integration/product"
@@ -110,7 +111,7 @@ func main() {
 		log.Println("[INFO] Redis rate limiting is disabled via configuration.")
 	}
 
-	// 9. Build Router
+	// 9. Build Router & HTTP Server
 	r := router.SetupRouter(router.RouterDeps{
 		Config:         cfg,
 		OrderHandler:   orderHandler,
@@ -121,7 +122,7 @@ func main() {
 		RateLimiter:    rateLimiter,
 	})
 
-	server := &http.Server{
+	httpServer := &http.Server{
 		Addr:         fmt.Sprintf(":%s", cfg.Port),
 		Handler:      r,
 		ReadTimeout:  10 * time.Second,
@@ -129,19 +130,32 @@ func main() {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	// 9. Graceful shutdown handler
+	// 10. Initialize gRPC Server
+	orderGRPCService := appgrpc.NewOrderServiceServer(orderRepo)
+	grpcServer := appgrpc.NewServer(cfg.GRPCPort, orderGRPCService)
+
+	// 11. Graceful shutdown handler
 	shutdownChan := make(chan os.Signal, 1)
 	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[INFO] Server listening on port %s", cfg.Port)
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Printf("[INFO] HTTP server listening on port %s", cfg.Port)
+		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("[FATAL] HTTP server runtime error: %v", err)
+		}
+	}()
+
+	go func() {
+		if err := grpcServer.Start(); err != nil {
+			log.Fatalf("[FATAL] gRPC server runtime error: %v", err)
 		}
 	}()
 
 	<-shutdownChan
 	log.Println("[INFO] Shutting down store_order service gracefully...")
+
+	// Stop gRPC server
+	grpcServer.Stop()
 
 	// Stop outbox worker
 	outboxWorker.Stop()
@@ -151,8 +165,8 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("[ERROR] Server shutdown error: %v", err)
+	if err := httpServer.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[ERROR] HTTP server shutdown error: %v", err)
 	}
 
 	log.Println("[INFO] store_order service stopped gracefully.")

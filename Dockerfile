@@ -8,13 +8,13 @@ WORKDIR /app
 # Install system dependencies required for Go modules, Prisma engine fetching, and SSL
 RUN apk add --no-cache git ca-certificates openssl
 
-# Pre-copy module manifests to leverage layer caching
+# Pre-copy module manifests and vendored dependencies
 COPY go.mod go.sum ./
-RUN go mod download
+COPY vendor/ ./vendor/
 
 # Copy Prisma schema and generate Linux-compatible Prisma Client Go engine
 COPY prisma/ ./prisma/
-RUN go run github.com/steebchen/prisma-client-go generate --schema=./prisma/schema.prisma
+RUN go run -mod=vendor github.com/steebchen/prisma-client-go generate --schema=./prisma/schema.prisma
 
 # Copy application source code and documentation
 COPY cmd/ ./cmd/
@@ -23,6 +23,7 @@ COPY docs/ ./docs/
 
 # Build static binary targeting Linux
 RUN CGO_ENABLED=0 GOOS=linux go build \
+    -mod=vendor \
     -ldflags="-w -s" \
     -o /app/bin/server \
     ./cmd/server/main.go
@@ -50,10 +51,11 @@ USER appuser:appgroup
 
 # Environment variable defaults
 ENV PORT=8060 \
+    GRPC_PORT=50051 \
     DEV=false \
     ENABLE_DOCS=true
 
-EXPOSE 8060
+EXPOSE 8060 50051
 
 # Built-in health probe using the /health endpoint
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \

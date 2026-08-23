@@ -13,6 +13,7 @@ type OrderRepository interface {
 	GetOrderByID(ctx context.Context, orderID string) (*db.OrderModel, error)
 	GetOrderByOrderNumber(ctx context.Context, orderNumber string) (*db.OrderModel, error)
 	ListOrdersByUserID(ctx context.Context, userID string, limit, offset int) ([]db.OrderModel, int, error)
+	ListActiveOrdersByUserID(ctx context.Context, userID string) ([]db.OrderModel, error)
 	ListAllOrders(ctx context.Context, filter OrderFilter) ([]db.OrderModel, int, error)
 	UpdateOrderStatusWithOutbox(ctx context.Context, orderID string, newStatus db.OrderStatus, meta *PaymentMetadata, shipping *ShippingMetadata, outbox *OutboxCreateInput) (*db.OrderModel, error)
 	UpdateSnapToken(ctx context.Context, orderID, snapToken, snapRedirectURL string) error
@@ -163,6 +164,29 @@ func (r *SQLOrderRepository) ListOrdersByUserID(ctx context.Context, userID stri
 	}
 
 	return orders, len(total), nil
+}
+
+// ListActiveOrdersByUserID queries active in-flight orders (PENDING_PAYMENT, PAID, PROCESSING, SHIPPED) for a user.
+// Why: Enables fast synchronous verification for inter-service RPC guards like account deletion pre-flight checks.
+func (r *SQLOrderRepository) ListActiveOrdersByUserID(ctx context.Context, userID string) ([]db.OrderModel, error) {
+	activeStatuses := []db.OrderStatus{
+		db.OrderStatusPendingPayment,
+		db.OrderStatusPaid,
+		db.OrderStatusProcessing,
+		db.OrderStatusShipped,
+	}
+
+	orders, err := r.client.Order.FindMany(
+		db.Order.UserID.Equals(userID),
+		db.Order.Status.In(activeStatuses),
+	).OrderBy(
+		db.Order.CreatedAt.Order(db.SortOrderDesc),
+	).Exec(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch active orders for user %s: %w", userID, err)
+	}
+
+	return orders, nil
 }
 
 // ListAllOrders queries orders across all users with optional status and search filters for administrative views.

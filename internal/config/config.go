@@ -12,17 +12,18 @@ import (
 
 // Config aggregates all operational parameters required to boot and run the store_order microservice.
 type Config struct {
-	Port                 string
-	Dev                  bool
-	EnableDocs           bool
-	DatabaseURL          string
-	KafkaBrokers         []string
-	ProductServiceURL    string
-	MidtransServerKey    string
-	MidtransClientKey    string
+	Port                  string
+	GRPCPort              string
+	Dev                   bool
+	EnableDocs            bool
+	DatabaseURL           string
+	KafkaBrokers          []string
+	ProductServiceURL     string
+	MidtransServerKey     string
+	MidtransClientKey     string
 	MidtransIsProduction bool
-	RedisURL             string
-	RedisPassword        string
+	RedisURL              string
+	RedisPassword         string
 	RedisRateLimitEnabled bool
 }
 
@@ -34,6 +35,7 @@ func Load() *Config {
 	}
 
 	port := getEnv("PORT", "8060")
+	grpcPort := getEnv("GRPC_PORT", "50051")
 	devStr := strings.ToLower(strings.TrimSpace(getEnv("DEV", "false")))
 	dev := devStr == "true" || devStr == "1"
 
@@ -63,6 +65,7 @@ func Load() *Config {
 
 	return &Config{
 		Port:                  port,
+		GRPCPort:              grpcPort,
 		Dev:                   dev,
 		EnableDocs:            enableDocs,
 		DatabaseURL:           databaseURL,
