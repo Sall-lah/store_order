@@ -62,6 +62,7 @@ func (m *MockOrderRepository) CreateOrderWithItemsAndOutbox(
 			Status:          db.OrderStatusPendingPayment,
 			TotalAmount:     orderInput.TotalAmount,
 			ShippingFee:     orderInput.ShippingFee,
+			ShippingAddress: &orderInput.ShippingAddress,
 			SnapToken:       &orderInput.SnapToken,
 			SnapRedirectURL: &orderInput.SnapRedirectURL,
 			CreatedAt:       now,
@@ -162,6 +163,37 @@ func (m *MockOrderRepository) UpdateSnapToken(ctx context.Context, orderID, snap
 		o.InnerOrder.SnapToken = &snapToken
 		o.InnerOrder.SnapRedirectURL = &snapRedirectURL
 	}
+	return nil
+}
+
+func (m *MockOrderRepository) AnonymizeUserOrdersAndCancelUnpaid(ctx context.Context, userID string, anonymizedEmail string, outboxEvents []repository.OutboxCreateInput) error {
+	emptyStr := ""
+	anonymizedAddr := "[ANONYMIZED]"
+	for _, o := range m.orders {
+		if o.UserID == userID {
+			o.InnerOrder.UserEmail = anonymizedEmail
+			o.InnerOrder.ShippingAddress = &anonymizedAddr
+			o.InnerOrder.SnapToken = &emptyStr
+			o.InnerOrder.SnapRedirectURL = &emptyStr
+			if o.Status == db.OrderStatusPendingPayment {
+				o.InnerOrder.Status = db.OrderStatusCancelled
+			}
+		}
+	}
+	m.outboxEvents = append(m.outboxEvents, outboxEvents...)
+	return nil
+}
+
+func (m *MockOrderRepository) CancelUnpaidUserOrders(ctx context.Context, userID string, outboxEvents []repository.OutboxCreateInput) error {
+	emptyStr := ""
+	for _, o := range m.orders {
+		if o.UserID == userID && o.Status == db.OrderStatusPendingPayment {
+			o.InnerOrder.Status = db.OrderStatusCancelled
+			o.InnerOrder.SnapToken = &emptyStr
+			o.InnerOrder.SnapRedirectURL = &emptyStr
+		}
+	}
+	m.outboxEvents = append(m.outboxEvents, outboxEvents...)
 	return nil
 }
 
@@ -621,4 +653,283 @@ func TestOrderExpiration_OutboxEventSchema(t *testing.T) {
 		}
 	})
 }
+
+// TestHandleUserDeleted verifies that user account deletion cancels unpaid orders, emits cancellation outbox events,
+// and redacts PII across all historical orders.
+// Why: Validates compliance with user lifecycle event handling and GDPR data scrubbing requirements.
+func TestHandleUserDeleted(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Unpaid orders cancelled and PII anonymized with outbox event", func(t *testing.T) {
+		repo := NewMockOrderRepo()
+		svc := service.NewOrderService(repo, &MockProductClient{}, &MockMidtransClient{}, "test-key", true)
+		userID := "usr_cleanup_1"
+		userEmail := "user1@example.com"
+
+		// 1. Create a pending payment order
+		checkoutResp, err := svc.Checkout(ctx, userID, userEmail, service.CheckoutRequest{
+			Items: []product.ItemOrderRequest{
+				{ProductID: "prod_1", VariantID: "var_1", Quantity: 2},
+			},
+			ShippingFee:     15000,
+			ShippingAddress: "Jl. Sudirman 100, Jakarta",
+		})
+		if err != nil {
+			t.Fatalf("checkout failed: %v", err)
+		}
+		if checkoutResp.Status != "PENDING_PAYMENT" {
+			t.Fatalf("expected PENDING_PAYMENT, got %s", checkoutResp.Status)
+		}
+
+		// Initial outbox count from checkout (order.created)
+		initialOutboxCount := len(repo.outboxEvents)
+
+		// 2. Handle user deleted event
+		if err := svc.HandleUserDeleted(ctx, userID); err != nil {
+			t.Fatalf("HandleUserDeleted failed: %v", err)
+		}
+
+		// 3. Verify order status is CANCELLED and PII is scrubbed
+		updatedOrder, err := repo.GetOrderByID(ctx, checkoutResp.ID)
+		if err != nil || updatedOrder == nil {
+			t.Fatalf("order not found: %v", err)
+		}
+		if updatedOrder.Status != db.OrderStatusCancelled {
+			t.Errorf("expected status CANCELLED, got %s", updatedOrder.Status)
+		}
+		expectedAnonymizedEmail := "deleted_user_usr_cleanup_1@anonymized.local"
+		if updatedOrder.UserEmail != expectedAnonymizedEmail {
+			t.Errorf("expected userEmail %s, got %s", expectedAnonymizedEmail, updatedOrder.UserEmail)
+		}
+		if addr, ok := updatedOrder.ShippingAddress(); !ok || addr != "[ANONYMIZED]" {
+			t.Errorf("expected shippingAddress [ANONYMIZED], got %s", addr)
+		}
+		if token, ok := updatedOrder.SnapToken(); !ok || token != "" {
+			t.Errorf("expected empty snapToken, got %s", token)
+		}
+		if url, ok := updatedOrder.SnapRedirectURL(); !ok || url != "" {
+			t.Errorf("expected empty snapRedirectUrl, got %s", url)
+		}
+
+		// 4. Verify outbox event emitted for order cancellation
+		if len(repo.outboxEvents) != initialOutboxCount+1 {
+			t.Fatalf("expected %d outbox events, got %d", initialOutboxCount+1, len(repo.outboxEvents))
+		}
+		cancelOutbox := repo.outboxEvents[len(repo.outboxEvents)-1]
+		if cancelOutbox.Topic != service.TopicOrderEvents {
+			t.Errorf("expected topic %s, got %s", service.TopicOrderEvents, cancelOutbox.Topic)
+		}
+
+		var envelope service.DomainEventEnvelope
+		if err := json.Unmarshal([]byte(cancelOutbox.Payload), &envelope); err != nil {
+			t.Fatalf("failed to decode outbox envelope: %v", err)
+		}
+		if envelope.EventType != service.EventTypeOrderCancelled {
+			t.Errorf("expected event_type %s, got %s", service.EventTypeOrderCancelled, envelope.EventType)
+		}
+
+		dataMap, ok := envelope.Data.(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected envelope data to be map, got %T", envelope.Data)
+		}
+		if dataMap["reason"] != "User account deleted" {
+			t.Errorf("expected reason 'User account deleted', got %v", dataMap["reason"])
+		}
+		if dataMap["status"] != "CANCELLED" {
+			t.Errorf("expected status CANCELLED, got %v", dataMap["status"])
+		}
+	})
+
+	t.Run("Completed order status preserved while PII is anonymized", func(t *testing.T) {
+		repo := NewMockOrderRepo()
+		svc := service.NewOrderService(repo, &MockProductClient{}, &MockMidtransClient{}, "test-key", true)
+		userID := "usr_cleanup_2"
+
+		checkoutResp, err := svc.Checkout(ctx, userID, "user2@example.com", service.CheckoutRequest{
+			Items: []product.ItemOrderRequest{
+				{ProductID: "prod_2", VariantID: "var_2", Quantity: 1},
+			},
+			ShippingFee:     10000,
+			ShippingAddress: "Jl. Thamrin 200, Jakarta",
+		})
+		if err != nil {
+			t.Fatalf("checkout failed: %v", err)
+		}
+
+		// Simulate payment and admin complete
+		_, _ = svc.SimulatePaymentSuccess(ctx, checkoutResp.ID)
+		_, _ = svc.AdminUpdateStatus(ctx, checkoutResp.ID, "COMPLETED", "JNE", "JNE123")
+
+		outboxCountBeforeCleanup := len(repo.outboxEvents)
+
+		// Trigger cleanup
+		if err := svc.HandleUserDeleted(ctx, userID); err != nil {
+			t.Fatalf("HandleUserDeleted failed: %v", err)
+		}
+
+		updatedOrder, _ := repo.GetOrderByID(ctx, checkoutResp.ID)
+		if updatedOrder.Status != db.OrderStatusCompleted {
+			t.Errorf("expected status to remain COMPLETED, got %s", updatedOrder.Status)
+		}
+		expectedAnonymizedEmail := "deleted_user_usr_cleanup_2@anonymized.local"
+		if updatedOrder.UserEmail != expectedAnonymizedEmail {
+			t.Errorf("expected userEmail %s, got %s", expectedAnonymizedEmail, updatedOrder.UserEmail)
+		}
+		if addr, ok := updatedOrder.ShippingAddress(); !ok || addr != "[ANONYMIZED]" {
+			t.Errorf("expected shippingAddress [ANONYMIZED], got %s", addr)
+		}
+
+		// No extra cancellation outbox event should be emitted
+		if len(repo.outboxEvents) != outboxCountBeforeCleanup {
+			t.Errorf("expected no additional outbox event, got %d (was %d)", len(repo.outboxEvents), outboxCountBeforeCleanup)
+		}
+	})
+
+	t.Run("User with no orders completes gracefully", func(t *testing.T) {
+		repo := NewMockOrderRepo()
+		svc := service.NewOrderService(repo, &MockProductClient{}, &MockMidtransClient{}, "test-key", true)
+
+		if err := svc.HandleUserDeleted(ctx, "usr_non_existent"); err != nil {
+			t.Errorf("expected no error for non-existent user orders, got: %v", err)
+		}
+	})
+
+	t.Run("Validation error on empty user ID", func(t *testing.T) {
+		repo := NewMockOrderRepo()
+		svc := service.NewOrderService(repo, &MockProductClient{}, &MockMidtransClient{}, "test-key", true)
+
+		if err := svc.HandleUserDeleted(ctx, "   "); err == nil {
+			t.Error("expected validation error for empty user ID, got nil")
+		}
+	})
+}
+
+// TestHandleUserBanned verifies that account suspension cancels in-flight unpaid orders and emits cancellation outbox events
+// while strictly preserving customer email and shipping address across all orders for forensic retention.
+// Why: Validates policy compliance for banned accounts without destroying legal evidence or fraud ledgers.
+func TestHandleUserBanned(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("Unpaid orders cancelled and PII preserved with outbox event", func(t *testing.T) {
+		repo := NewMockOrderRepo()
+		svc := service.NewOrderService(repo, &MockProductClient{}, &MockMidtransClient{}, "test-key", true)
+		userID := "usr_ban_test_1"
+		userEmail := "fraud_suspect@example.com"
+		userAddress := "Jl. Sudirman 100, Jakarta"
+
+		checkoutResp, err := svc.Checkout(ctx, userID, userEmail, service.CheckoutRequest{
+			Items: []product.ItemOrderRequest{
+				{ProductID: "prod_1", VariantID: "var_1", Quantity: 2},
+			},
+			ShippingFee:     15000,
+			ShippingAddress: userAddress,
+		})
+		if err != nil {
+			t.Fatalf("checkout failed: %v", err)
+		}
+
+		initialOutboxCount := len(repo.outboxEvents)
+
+		if err := svc.HandleUserBanned(ctx, userID, "Fraudulent dispute history"); err != nil {
+			t.Fatalf("HandleUserBanned failed: %v", err)
+		}
+
+		updatedOrder, err := repo.GetOrderByID(ctx, checkoutResp.ID)
+		if err != nil || updatedOrder == nil {
+			t.Fatalf("order not found: %v", err)
+		}
+		if updatedOrder.Status != db.OrderStatusCancelled {
+			t.Errorf("expected status CANCELLED, got %s", updatedOrder.Status)
+		}
+
+		// Verify PII is NOT anonymized
+		if updatedOrder.UserEmail != userEmail {
+			t.Errorf("expected original email %s preserved, got %s", userEmail, updatedOrder.UserEmail)
+		}
+		if addr, ok := updatedOrder.ShippingAddress(); !ok || addr != userAddress {
+			t.Errorf("expected original address %s preserved, got %s", userAddress, addr)
+		}
+		if token, ok := updatedOrder.SnapToken(); !ok || token != "" {
+			t.Errorf("expected empty snapToken, got %s", token)
+		}
+
+		// Verify cancellation outbox event
+		if len(repo.outboxEvents) != initialOutboxCount+1 {
+			t.Fatalf("expected %d outbox events, got %d", initialOutboxCount+1, len(repo.outboxEvents))
+		}
+		cancelOutbox := repo.outboxEvents[len(repo.outboxEvents)-1]
+		var envelope service.DomainEventEnvelope
+		if err := json.Unmarshal([]byte(cancelOutbox.Payload), &envelope); err != nil {
+			t.Fatalf("failed to decode outbox envelope: %v", err)
+		}
+		if envelope.EventType != service.EventTypeOrderCancelled {
+			t.Errorf("expected event_type %s, got %s", service.EventTypeOrderCancelled, envelope.EventType)
+		}
+
+		dataMap, ok := envelope.Data.(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected envelope data to be map, got %T", envelope.Data)
+		}
+		expectedReason := "User account banned: Fraudulent dispute history"
+		if dataMap["reason"] != expectedReason {
+			t.Errorf("expected reason '%s', got '%v'", expectedReason, dataMap["reason"])
+		}
+		if dataMap["userEmail"] != userEmail {
+			t.Errorf("expected userEmail %s, got %v", userEmail, dataMap["userEmail"])
+		}
+	})
+
+	t.Run("Completed orders untouched and PII preserved", func(t *testing.T) {
+		repo := NewMockOrderRepo()
+		svc := service.NewOrderService(repo, &MockProductClient{}, &MockMidtransClient{}, "test-key", true)
+		userID := "usr_ban_test_2"
+		userEmail := "banned_customer2@example.com"
+		userAddress := "Jl. Thamrin 200, Jakarta"
+
+		checkoutResp, err := svc.Checkout(ctx, userID, userEmail, service.CheckoutRequest{
+			Items: []product.ItemOrderRequest{
+				{ProductID: "prod_2", VariantID: "var_2", Quantity: 1},
+			},
+			ShippingFee:     10000,
+			ShippingAddress: userAddress,
+		})
+		if err != nil {
+			t.Fatalf("checkout failed: %v", err)
+		}
+
+		_, _ = svc.SimulatePaymentSuccess(ctx, checkoutResp.ID)
+		_, _ = svc.AdminUpdateStatus(ctx, checkoutResp.ID, "COMPLETED", "JNE", "JNE123")
+
+		outboxCountBeforeBan := len(repo.outboxEvents)
+
+		if err := svc.HandleUserBanned(ctx, userID, ""); err != nil {
+			t.Fatalf("HandleUserBanned failed: %v", err)
+		}
+
+		updatedOrder, _ := repo.GetOrderByID(ctx, checkoutResp.ID)
+		if updatedOrder.Status != db.OrderStatusCompleted {
+			t.Errorf("expected status to remain COMPLETED, got %s", updatedOrder.Status)
+		}
+		if updatedOrder.UserEmail != userEmail {
+			t.Errorf("expected original email %s preserved, got %s", userEmail, updatedOrder.UserEmail)
+		}
+		if addr, ok := updatedOrder.ShippingAddress(); !ok || addr != userAddress {
+			t.Errorf("expected original address %s preserved, got %s", userAddress, addr)
+		}
+		if len(repo.outboxEvents) != outboxCountBeforeBan {
+			t.Errorf("expected no additional outbox event, got %d (was %d)", len(repo.outboxEvents), outboxCountBeforeBan)
+		}
+	})
+
+	t.Run("Validation error on empty user ID", func(t *testing.T) {
+		repo := NewMockOrderRepo()
+		svc := service.NewOrderService(repo, &MockProductClient{}, &MockMidtransClient{}, "test-key", true)
+
+		if err := svc.HandleUserBanned(ctx, "   ", ""); err == nil {
+			t.Error("expected validation error for empty user ID, got nil")
+		}
+	})
+}
+
+
 

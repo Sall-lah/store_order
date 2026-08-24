@@ -112,6 +112,14 @@ func (m *MockServiceOrderRepo) UpdateSnapToken(ctx context.Context, orderID, sna
 	return nil
 }
 
+func (m *MockServiceOrderRepo) AnonymizeUserOrdersAndCancelUnpaid(ctx context.Context, userID string, anonymizedEmail string, outboxEvents []repository.OutboxCreateInput) error {
+	return nil
+}
+
+func (m *MockServiceOrderRepo) CancelUnpaidUserOrders(ctx context.Context, userID string, outboxEvents []repository.OutboxCreateInput) error {
+	return nil
+}
+
 type MockHandlerProductClient struct{}
 
 func (m *MockHandlerProductClient) GetProductByID(ctx context.Context, id string) (*product.ProductDTO, error) {

@@ -27,10 +27,11 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // OrderService exposes high-performance gRPC RPCs for inter-service order operations.
-// Used by the User Service to perform synchronous pre-flight checks before account lifecycle transitions.
+// Used by the User Service to perform synchronous pre-flight validation exclusively for user-initiated
+// account deletion. (Note: Admin bans/suspensions bypass gRPC and operate via event-driven Kafka topics).
 type OrderServiceClient interface {
 	// CheckActiveOrders inspects the order database to determine if a target user has any active,
-	// in-flight orders (PENDING_PAYMENT, PAID, PROCESSING, SHIPPED) that prevent account deletion.
+	// in-flight orders (PENDING_PAYMENT, PAID, PROCESSING, SHIPPED) that prevent self-service account deletion.
 	CheckActiveOrders(ctx context.Context, in *CheckActiveOrdersRequest, opts ...grpc.CallOption) (*CheckActiveOrdersResponse, error)
 }
 
@@ -57,10 +58,11 @@ func (c *orderServiceClient) CheckActiveOrders(ctx context.Context, in *CheckAct
 // for forward compatibility.
 //
 // OrderService exposes high-performance gRPC RPCs for inter-service order operations.
-// Used by the User Service to perform synchronous pre-flight checks before account lifecycle transitions.
+// Used by the User Service to perform synchronous pre-flight validation exclusively for user-initiated
+// account deletion. (Note: Admin bans/suspensions bypass gRPC and operate via event-driven Kafka topics).
 type OrderServiceServer interface {
 	// CheckActiveOrders inspects the order database to determine if a target user has any active,
-	// in-flight orders (PENDING_PAYMENT, PAID, PROCESSING, SHIPPED) that prevent account deletion.
+	// in-flight orders (PENDING_PAYMENT, PAID, PROCESSING, SHIPPED) that prevent self-service account deletion.
 	CheckActiveOrders(context.Context, *CheckActiveOrdersRequest) (*CheckActiveOrdersResponse, error)
 	mustEmbedUnimplementedOrderServiceServer()
 }

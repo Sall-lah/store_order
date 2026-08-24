@@ -54,6 +54,14 @@ func (m *mockOrderRepo) UpdateSnapToken(ctx context.Context, orderID, snapToken,
 	return errors.New("not implemented")
 }
 
+func (m *mockOrderRepo) AnonymizeUserOrdersAndCancelUnpaid(ctx context.Context, userID string, anonymizedEmail string, outboxEvents []repository.OutboxCreateInput) error {
+	return errors.New("not implemented")
+}
+
+func (m *mockOrderRepo) CancelUnpaidUserOrders(ctx context.Context, userID string, outboxEvents []repository.OutboxCreateInput) error {
+	return errors.New("not implemented")
+}
+
 // TestStatusMappers tests bidirectional mapping between database order status and protobuf enum values.
 func TestStatusMappers(t *testing.T) {
 	cases := []struct {

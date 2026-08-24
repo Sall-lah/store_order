@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Sall-lah/store_order/internal/config"
+	"github.com/Sall-lah/store_order/internal/consumer"
 	"github.com/Sall-lah/store_order/internal/db"
 	appgrpc "github.com/Sall-lah/store_order/internal/grpc"
 	"github.com/Sall-lah/store_order/internal/handler"
@@ -64,13 +65,18 @@ func main() {
 	productClient := product.NewClient(cfg.ProductServiceURL)
 	midtransClient := midtrans.NewSnapClient(cfg.MidtransServerKey, cfg.MidtransIsProduction, cfg.Dev)
 
-	// 6. Initialize Order Service & Outbox Worker
+	// 6. Initialize Order Service, Outbox Worker & User Event Consumer
 	orderService := service.NewOrderService(orderRepo, productClient, midtransClient, cfg.MidtransServerKey, cfg.Dev)
 	outboxWorker := outbox.NewWorker(outboxRepo, kafkaProducer, 200*time.Millisecond, 50, cfg.Dev)
+	userEventConsumer := consumer.NewUserEventConsumer(cfg.KafkaBrokers, cfg.KafkaTopicUserEvents, cfg.KafkaUserEventsGroupID, orderService, cfg.Dev)
 
 	workerCtx, workerCancel := context.WithCancel(context.Background())
 	defer workerCancel()
 	outboxWorker.Start(workerCtx)
+
+	consumerCtx, consumerCancel := context.WithCancel(context.Background())
+	defer consumerCancel()
+	userEventConsumer.Start(consumerCtx)
 
 	// 7. Initialize Handlers
 	orderHandler := handler.NewOrderHandler(orderService)
@@ -153,6 +159,10 @@ func main() {
 
 	<-shutdownChan
 	log.Println("[INFO] Shutting down store_order service gracefully...")
+
+	// Stop user events consumer
+	consumerCancel()
+	_ = userEventConsumer.Close()
 
 	// Stop gRPC server
 	grpcServer.Stop()

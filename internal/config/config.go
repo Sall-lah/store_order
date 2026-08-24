@@ -18,6 +18,8 @@ type Config struct {
 	EnableDocs            bool
 	DatabaseURL           string
 	KafkaBrokers          []string
+	KafkaTopicUserEvents  string
+	KafkaUserEventsGroupID string
 	ProductServiceURL     string
 	MidtransServerKey     string
 	MidtransClientKey     string
@@ -46,6 +48,8 @@ func Load() *Config {
 	
 	kafkaBrokersStr := getEnv("KAFKA_BROKERS", "localhost:9092")
 	kafkaBrokers := splitAndTrim(kafkaBrokersStr, ",")
+	kafkaTopicUserEvents := getEnv("KAFKA_TOPIC_USER_EVENTS", "user.events")
+	kafkaUserEventsGroupID := getEnv("KAFKA_USER_EVENTS_GROUP_ID", "store_order_user_events")
 
 	productServiceURL := strings.TrimRight(getEnv("PRODUCT_SERVICE_URL", "http://localhost:8040"), "/")
 
@@ -70,6 +74,8 @@ func Load() *Config {
 		EnableDocs:            enableDocs,
 		DatabaseURL:           databaseURL,
 		KafkaBrokers:          kafkaBrokers,
+		KafkaTopicUserEvents:  kafkaTopicUserEvents,
+		KafkaUserEventsGroupID: kafkaUserEventsGroupID,
 		ProductServiceURL:     productServiceURL,
 		MidtransServerKey:     midtransServerKey,
 		MidtransClientKey:     midtransClientKey,

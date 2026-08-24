@@ -17,6 +17,8 @@ type OrderRepository interface {
 	ListAllOrders(ctx context.Context, filter OrderFilter) ([]db.OrderModel, int, error)
 	UpdateOrderStatusWithOutbox(ctx context.Context, orderID string, newStatus db.OrderStatus, meta *PaymentMetadata, shipping *ShippingMetadata, outbox *OutboxCreateInput) (*db.OrderModel, error)
 	UpdateSnapToken(ctx context.Context, orderID, snapToken, snapRedirectURL string) error
+	AnonymizeUserOrdersAndCancelUnpaid(ctx context.Context, userID string, anonymizedEmail string, outboxEvents []OutboxCreateInput) error
+	CancelUnpaidUserOrders(ctx context.Context, userID string, outboxEvents []OutboxCreateInput) error
 }
 
 // SQLOrderRepository implements OrderRepository using Prisma Client Go.
@@ -299,4 +301,110 @@ func (r *SQLOrderRepository) UpdateSnapToken(ctx context.Context, orderID, snapT
 		db.Order.SnapRedirectURL.Set(snapRedirectURL),
 	).Exec(ctx)
 	return err
+}
+
+// AnonymizeUserOrdersAndCancelUnpaid atomically updates customer orders for a deleted account:
+// it cancels lingering unpaid orders, persists cancellation outbox notifications for inventory release,
+// and redacts personal identifiable data (email, address, Snap tokens) across all historical orders.
+// Why: Enforces GDPR compliance and prevents stale stock reservations when user accounts are deleted.
+func (r *SQLOrderRepository) AnonymizeUserOrdersAndCancelUnpaid(
+	ctx context.Context,
+	userID string,
+	anonymizedEmail string,
+	outboxEvents []OutboxCreateInput,
+) error {
+	orders, err := r.client.Order.FindMany(
+		db.Order.UserID.Equals(userID),
+	).Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list orders for user deletion cleanup (userID: %s): %w", userID, err)
+	}
+
+	for _, order := range orders {
+		var updateParams []db.OrderSetParam
+		updateParams = append(updateParams,
+			db.Order.UserEmail.Set(anonymizedEmail),
+			db.Order.ShippingAddress.Set("[ANONYMIZED]"),
+			db.Order.SnapToken.Set(""),
+			db.Order.SnapRedirectURL.Set(""),
+		)
+		if order.Status == db.OrderStatusPendingPayment {
+			updateParams = append(updateParams, db.Order.Status.Set(db.OrderStatusCancelled))
+		}
+
+		_, err := r.client.Order.FindUnique(
+			db.Order.ID.Equals(order.ID),
+		).Update(
+			updateParams...,
+		).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to anonymize and update order %s: %w", order.ID, err)
+		}
+	}
+
+	for _, outbox := range outboxEvents {
+		aggType := outbox.AggregateType
+		if aggType == "" {
+			aggType = "ORDER"
+		}
+		_, err := r.client.OutboxEvent.CreateOne(
+			db.OutboxEvent.AggregateID.Set(outbox.AggregateID),
+			db.OutboxEvent.Topic.Set(outbox.Topic),
+			db.OutboxEvent.Payload.Set(outbox.Payload),
+			db.OutboxEvent.AggregateType.Set(aggType),
+		).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to persist cancellation outbox event for order %s: %w", outbox.AggregateID, err)
+		}
+	}
+
+	return nil
+}
+
+// CancelUnpaidUserOrders cancels all in-flight PENDING_PAYMENT orders for a banned user account and clears
+// payment redirect credentials, while strictly preserving all customer PII (email, address) and completed order history.
+// Why: Releases reserved inventory back to catalog without destroying legal evidence or fraud audit trails.
+func (r *SQLOrderRepository) CancelUnpaidUserOrders(
+	ctx context.Context,
+	userID string,
+	outboxEvents []OutboxCreateInput,
+) error {
+	orders, err := r.client.Order.FindMany(
+		db.Order.UserID.Equals(userID),
+		db.Order.Status.Equals(db.OrderStatusPendingPayment),
+	).Exec(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to find pending orders for banned user %s: %w", userID, err)
+	}
+
+	for _, order := range orders {
+		_, err := r.client.Order.FindUnique(
+			db.Order.ID.Equals(order.ID),
+		).Update(
+			db.Order.Status.Set(db.OrderStatusCancelled),
+			db.Order.SnapToken.Set(""),
+			db.Order.SnapRedirectURL.Set(""),
+		).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to cancel pending order %s for banned user: %w", order.ID, err)
+		}
+	}
+
+	for _, outbox := range outboxEvents {
+		aggType := outbox.AggregateType
+		if aggType == "" {
+			aggType = "ORDER"
+		}
+		_, err := r.client.OutboxEvent.CreateOne(
+			db.OutboxEvent.AggregateID.Set(outbox.AggregateID),
+			db.OutboxEvent.Topic.Set(outbox.Topic),
+			db.OutboxEvent.Payload.Set(outbox.Payload),
+			db.OutboxEvent.AggregateType.Set(aggType),
+		).Exec(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to persist cancellation outbox event for order %s: %w", outbox.AggregateID, err)
+		}
+	}
+
+	return nil
 }

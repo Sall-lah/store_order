@@ -122,6 +122,8 @@ type OrderService interface {
 	SimulatePaymentSuccess(ctx context.Context, orderID string) (*OrderResponse, error)
 	SimulateOrderCancel(ctx context.Context, orderID string) (*OrderResponse, error)
 	SimulateOrderExpire(ctx context.Context, orderID string) (*OrderResponse, error)
+	HandleUserDeleted(ctx context.Context, userID string) error
+	HandleUserBanned(ctx context.Context, userID string, reason string) error
 }
 
 // Service coordinates order business logic, external integrations, and atomic outbox updates.
@@ -583,6 +585,97 @@ func (s *Service) SimulateOrderExpire(ctx context.Context, orderID string) (*Ord
 	}
 
 	return ToOrderResponse(updated), nil
+}
+
+// HandleUserDeleted orchestrates asynchronous account deletion cleanup across the order domain:
+// it automatically cancels lingering unpaid orders (PENDING_PAYMENT), emits order.cancelled outbox events
+// to notify downstream services (e.g. store_product inventory restock), and redacts PII across all historical orders.
+// Why: Enforces GDPR Right-to-be-Forgotten compliance without corrupting historical accounting and tax ledgers.
+func (s *Service) HandleUserDeleted(ctx context.Context, userID string) error {
+	trimmedUserID := strings.TrimSpace(userID)
+	if trimmedUserID == "" {
+		return errors.New("user ID is required")
+	}
+
+	orders, _, err := s.orderRepo.ListOrdersByUserID(ctx, trimmedUserID, 1000, 0)
+	if err != nil {
+		return fmt.Errorf("failed to fetch orders for user %s: %w", trimmedUserID, err)
+	}
+
+	anonymizedEmail := fmt.Sprintf("deleted_user_%s@anonymized.local", trimmedUserID)
+	var outboxEvents []repository.OutboxCreateInput
+
+	for _, order := range orders {
+		if order.Status == db.OrderStatusPendingPayment {
+			orderCopy := order
+			orderCopy.InnerOrder.Status = db.OrderStatusCancelled
+			eventData := buildOrderEventData(&orderCopy, "User account deleted")
+			eventPayload, err := json.Marshal(NewDomainEventEnvelope(EventTypeOrderCancelled, eventData))
+			if err != nil {
+				return fmt.Errorf("failed to marshal cancellation outbox event for order %s: %w", order.ID, err)
+			}
+
+			outboxEvents = append(outboxEvents, repository.OutboxCreateInput{
+				AggregateType: "ORDER",
+				AggregateID:   order.ID,
+				Topic:         TopicOrderEvents,
+				Payload:       string(eventPayload),
+			})
+		}
+	}
+
+	if err := s.orderRepo.AnonymizeUserOrdersAndCancelUnpaid(ctx, trimmedUserID, anonymizedEmail, outboxEvents); err != nil {
+		return fmt.Errorf("failed to anonymize and cancel orders for user %s: %w", trimmedUserID, err)
+	}
+
+	return nil
+}
+
+// HandleUserBanned orchestrates the cancellation of in-flight unpaid orders for a banned customer account:
+// it automatically transitions PENDING_PAYMENT orders to CANCELLED and emits order.cancelled outbox events
+// to release catalog inventory in store_product, while strictly preserving all customer PII and completed orders.
+// Why: Frees reserved stock while preserving forensic customer records and evidence for fraud and chargeback defense.
+func (s *Service) HandleUserBanned(ctx context.Context, userID string, reason string) error {
+	trimmedUserID := strings.TrimSpace(userID)
+	if trimmedUserID == "" {
+		return errors.New("user ID is required")
+	}
+
+	orders, _, err := s.orderRepo.ListOrdersByUserID(ctx, trimmedUserID, 1000, 0)
+	if err != nil {
+		return fmt.Errorf("failed to fetch orders for banned user %s: %w", trimmedUserID, err)
+	}
+
+	cancelReason := "User account banned"
+	if strings.TrimSpace(reason) != "" {
+		cancelReason = fmt.Sprintf("User account banned: %s", strings.TrimSpace(reason))
+	}
+
+	var outboxEvents []repository.OutboxCreateInput
+	for _, order := range orders {
+		if order.Status == db.OrderStatusPendingPayment {
+			orderCopy := order
+			orderCopy.InnerOrder.Status = db.OrderStatusCancelled
+			eventData := buildOrderEventData(&orderCopy, cancelReason)
+			eventPayload, err := json.Marshal(NewDomainEventEnvelope(EventTypeOrderCancelled, eventData))
+			if err != nil {
+				return fmt.Errorf("failed to marshal cancellation outbox event for banned user order %s: %w", order.ID, err)
+			}
+
+			outboxEvents = append(outboxEvents, repository.OutboxCreateInput{
+				AggregateType: "ORDER",
+				AggregateID:   order.ID,
+				Topic:         TopicOrderEvents,
+				Payload:       string(eventPayload),
+			})
+		}
+	}
+
+	if err := s.orderRepo.CancelUnpaidUserOrders(ctx, trimmedUserID, outboxEvents); err != nil {
+		return fmt.Errorf("failed to cancel unpaid orders for banned user %s: %w", trimmedUserID, err)
+	}
+
+	return nil
 }
 
 // buildOrderEventData extracts full order metadata and line items into standard OrderEventData schema.

@@ -47,6 +47,7 @@ flowchart TD
         Service --> MidtransClient[Midtrans Snap Client]
         
         OutboxWorker[Transactional Outbox Worker] --> OutboxRepo
+        UserConsumer[User Event Kafka Consumer] --> Service
     end
 
     OrderRepo -->|Prisma Client| Postgres[(PostgreSQL DB)]
@@ -54,7 +55,8 @@ flowchart TD
     Middleware -->|Sliding Window Counter| Redis[(Redis)]
     ProductClient -->|HTTP GET /products| ProductSvc[Product Microservice]
     MidtransClient -->|HTTP POST /snap/v1/transactions| MidtransAPI[Midtrans Gateway]
-    OutboxWorker -->|Publish Events| Kafka[Apache Kafka Topics]
+    OutboxWorker -->|Publish Events: order.events| KafkaOut[Apache Kafka Outbound]
+    KafkaIn[Apache Kafka: user.events] -->|user.deleted / user.banned| UserConsumer
 ```
 
 ### Order Lifecycle State Machine
@@ -63,7 +65,7 @@ flowchart TD
 stateDiagram-v2
     [*] --> PENDING_PAYMENT: Checkout Created
     PENDING_PAYMENT --> PAID: Webhook Settlement / Dev Simulation
-    PENDING_PAYMENT --> CANCELLED: Customer / Admin Cancel / Dev Simulation
+    PENDING_PAYMENT --> CANCELLED: Customer / Admin Cancel / Dev Simulation / User Ban or Delete
     PENDING_PAYMENT --> EXPIRED: Payment Window Timeout / Midtrans Expiry
     PAID --> PROCESSING: Admin Status Update
     PROCESSING --> SHIPPED: Admin Status Update
@@ -84,6 +86,9 @@ stateDiagram-v2
 5. **API Gateway Offloading Authentication**: Seamlessly consumes verified upstream gateway headers (`X-User-Id`, `X-User-Email`, `X-User-Role`).
 6. **Embedded Interactive Documentation**: Live OpenAPI 3.1 documentation rendered via **Scalar UI** (`/docs`) and **Swagger UI** (`/swagger`).
 7. **Developer Simulation Mode**: Fast-track testing endpoints (`DEV=true`) allowing instant simulation of payment settlement, cancellation, and expiration without external webhook dependencies.
+8. **User Lifecycle Event Handling (`user.events`)**:
+   - **`user.deleted` (GDPR Right to be Forgotten)**: Auto-cancels in-flight `PENDING_PAYMENT` orders, redacts PII (`userEmail` masked, `shippingAddress` pseudonymized to `[ANONYMIZED]`, tokens cleared), and writes `order.cancelled` outbox events to release reserved stock in `store_product`.
+   - **`user.banned` (Fraud & Abuse Defense)**: Auto-cancels in-flight `PENDING_PAYMENT` orders to release inventory, while strictly preserving all customer PII, email, and shipping address records for forensic analysis and dispute defense.
 
 ---
 
@@ -247,13 +252,22 @@ The background **Outbox Worker** (`internal/outbox/worker.go`):
 
 ### Kafka Topics & Event Schemas
 
-| Topic | Trigger Condition | Payload Summary |
-| :--- | :--- | :--- |
-| `order.created` | Order initiated | Order ID, User ID, Items, Total Amount, Snap Token |
-| `order.paid` | Payment settlement confirmed | Order ID, Payment Type, Transaction ID, Paid Timestamp |
-| `order.cancelled` | Order cancelled by user/admin | Order ID, Cancellation Reason, User ID |
-| `order.expired` | Payment window expired | Order ID, Expiration Timestamp |
-| `order.fulfilled` | Order completed / delivered | Order ID, Fulfilled Timestamp |
+#### Outbound Domain Events (`order.events`)
+
+| Event Type | Trigger Condition | Payload Summary | Downstream Consumers |
+| :--- | :--- | :--- | :--- |
+| `order.created` | Order initiated | Order ID, User ID, Items, Total Amount, Snap Redirect URL | `store_notification` |
+| `order.paid` | Payment settlement confirmed | Order ID, Payment Type, Transaction ID, Paid Timestamp, Line Items | `store_notification` |
+| `order.cancelled` | Order cancelled by user/admin/ban/delete | Order ID, Cancellation Reason, User ID, Line Items | `store_product` (Restock inventory), `store_notification` |
+| `order.expired` | Payment window expired | Order ID, Expiration Reason, Line Items | `store_product` (Restock inventory), `store_notification` |
+| `order.fulfilled` | Order completed / delivered | Order ID, Courier Info, Tracking Number | `store_notification` |
+
+#### Inbound Consumer Events (`user.events`)
+
+| Event Type | Source Service | Action in `store_order` | PII Impact |
+| :--- | :--- | :--- | :--- |
+| `user.deleted` | `store_user` | Cancels unpaid orders, emits `order.cancelled` outbox event for inventory restock | **Anonymized**: `userEmail` masked, `shippingAddress` set to `[ANONYMIZED]`, tokens cleared |
+| `user.banned` | `store_user` | Cancels unpaid orders, emits `order.cancelled` outbox event for inventory restock | **Preserved**: All customer emails, shipping addresses, and completed orders retained for audit |
 
 ---
 
