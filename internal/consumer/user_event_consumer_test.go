@@ -333,19 +333,43 @@ func TestUserEventConsumer_ProcessMessage(t *testing.T) {
 			t.Fatal("expected error, got nil")
 		}
 	})
+
+	t.Run("valid user.banned flat payload with top-level reason dispatches correctly", func(t *testing.T) {
+		svc := newMockOrderService()
+		c := consumer.NewUserEventConsumerWithReader(&mockMessageReader{}, svc, true)
+
+		// Simulates exact JSON emitted by store_user Kafka producer
+		msg := kafkaGo.Message{
+			Topic:     "user.events",
+			Partition: 0,
+			Offset:    16,
+			Value:     []byte(`{"event":"user.banned","userId":"usr_ban_flat_prod","timestamp":"2026-08-24T16:00:00Z","reason":"Suspicious carding activity","event_type":"user.banned","user_id":"usr_ban_flat_prod"}`),
+		}
+
+		if err := c.ProcessMessage(ctx, msg); err != nil {
+			t.Fatalf("ProcessMessage failed: %v", err)
+		}
+
+		if len(svc.bannedUsers) != 1 || svc.bannedUsers[0] != "usr_ban_flat_prod" {
+			t.Errorf("expected bannedUsers [usr_ban_flat_prod], got %v", svc.bannedUsers)
+		}
+		if len(svc.banReasons) != 1 || svc.banReasons[0] != "Suspicious carding activity" {
+			t.Errorf("expected banReasons [Suspicious carding activity], got %v", svc.banReasons)
+		}
+	})
 }
 
 // TestExtractUserLifecycleEvent verifies parsing of user.deleted and user.banned events.
 // Why: Guarantees accurate discrimination between account deletion and account banning payloads.
 func TestExtractUserLifecycleEvent(t *testing.T) {
 	cases := []struct {
-		name          string
-		payload       string
-		expectedID    string
-		expectedType  string
+		name           string
+		payload        string
+		expectedID     string
+		expectedType   string
 		expectedReason string
-		expectNil     bool
-		expectErr     bool
+		expectNil      bool
+		expectErr      bool
 	}{
 		{
 			name:           "user.banned with nested reason",
@@ -357,11 +381,38 @@ func TestExtractUserLifecycleEvent(t *testing.T) {
 			expectErr:      false,
 		},
 		{
+			name:           "user.banned flat payload from store_user with dual keys and top-level reason",
+			payload:        `{"event":"user.banned","userId":"usr_ban_flat_1","timestamp":"2026-08-24T16:00:00Z","reason":"Fraudulent chargebacks","event_type":"user.banned","user_id":"usr_ban_flat_1"}`,
+			expectedID:     "usr_ban_flat_1",
+			expectedType:   "user.banned",
+			expectedReason: "Fraudulent chargebacks",
+			expectNil:      false,
+			expectErr:      false,
+		},
+		{
+			name:           "user.banned flat payload with only event key and top-level reason",
+			payload:        `{"event":"user.banned","id":"usr_ban_flat_2","reason":"policy violation"}`,
+			expectedID:     "usr_ban_flat_2",
+			expectedType:   "user.banned",
+			expectedReason: "policy violation",
+			expectNil:      false,
+			expectErr:      false,
+		},
+		{
 			name:           "user.deleted with nested user_id",
 			payload:        `{"event_type":"user.deleted","data":{"user_id":"usr_del_99"}}`,
 			expectedID:     "usr_del_99",
 			expectedType:   "user.deleted",
 			expectedReason: "",
+			expectNil:      false,
+			expectErr:      false,
+		},
+		{
+			name:           "user.deleted flat payload from store_user with top-level reason",
+			payload:        `{"event":"user.deleted","userId":"usr_del_flat_1","reason":"user_requested_deletion","event_type":"user.deleted","user_id":"usr_del_flat_1"}`,
+			expectedID:     "usr_del_flat_1",
+			expectedType:   "user.deleted",
+			expectedReason: "user_requested_deletion",
 			expectNil:      false,
 			expectErr:      false,
 		},

@@ -29,6 +29,7 @@ type MessageReader interface {
 type UserEventEnvelope struct {
 	EventID   string          `json:"event_id"`
 	EventType string          `json:"event_type"`
+	Event     string          `json:"event"`
 	Type      string          `json:"type"`
 	Timestamp string          `json:"timestamp"`
 	Producer  string          `json:"producer"`
@@ -38,6 +39,7 @@ type UserEventEnvelope struct {
 	UserID string `json:"user_id"`
 	UserId string `json:"userId"`
 	ID     string `json:"id"`
+	Reason string `json:"reason"`
 }
 
 // UserDeletedPayload represents the data payload for user.deleted events.
@@ -145,6 +147,9 @@ func ExtractUserLifecycleEvent(payload []byte) (*UserEventData, error) {
 
 	eventType := strings.ToLower(strings.TrimSpace(env.EventType))
 	if eventType == "" {
+		eventType = strings.ToLower(strings.TrimSpace(env.Event))
+	}
+	if eventType == "" {
 		eventType = strings.ToLower(strings.TrimSpace(env.Type))
 	}
 
@@ -191,6 +196,9 @@ func ExtractUserLifecycleEvent(payload []byte) (*UserEventData, error) {
 			targetUserID = env.ID
 		}
 	}
+	if reason == "" && env.Reason != "" {
+		reason = env.Reason
+	}
 
 	targetUserID = strings.TrimSpace(targetUserID)
 	if targetUserID == "" {
@@ -204,7 +212,7 @@ func ExtractUserLifecycleEvent(payload []byte) (*UserEventData, error) {
 	return &UserEventData{
 		UserID:    targetUserID,
 		EventType: eventType,
-		Reason:    reason,
+		Reason:    strings.TrimSpace(reason),
 	}, nil
 }
 
