@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -163,4 +164,110 @@ func TestRouter_LiveRedis_SlidingWindowIntegration(t *testing.T) {
 
 	t.Logf("Live Redis rate limiting integration test passed! Response status: %d, Retry-After: %s",
 		rec.Code, rec.Header().Get("Retry-After"))
+}
+
+func TestRouter_DocumentationRoutes_RelativeServing(t *testing.T) {
+	cfg := &config.Config{
+		Port:       "8060",
+		Dev:        true,
+		EnableDocs: true,
+	}
+
+	r := router.SetupRouter(router.RouterDeps{
+		Config:         cfg,
+		OrderHandler:   handler.NewOrderHandler(nil),
+		WebhookHandler: handler.NewWebhookHandler(nil),
+		AdminHandler:   handler.NewAdminHandler(nil),
+		DevHandler:     handler.NewDevHandler(nil),
+		HealthHandler:  handler.NewHealthHandler(nil),
+		RateLimiter:    nil,
+	})
+
+	// 1. Verify GET /docs redirects to /docs/
+	{
+		req := httptest.NewRequest(http.MethodGet, "/docs", nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMovedPermanently {
+			t.Fatalf("expected /docs to return 301 Moved Permanently, got %d", rec.Code)
+		}
+		if loc := rec.Header().Get("Location"); loc != "/docs/" {
+			t.Errorf("expected Location header '/docs/', got '%s'", loc)
+		}
+	}
+
+	// 2. Verify GET /docs/ serves Scalar UI with relative data-url="./openapi.json"
+	{
+		req := httptest.NewRequest(http.MethodGet, "/docs/", nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected /docs/ to return 200 OK, got %d", rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, `data-url="./openapi.json"`) {
+			t.Errorf("expected Scalar UI to reference './openapi.json', body was:\n%s", body)
+		}
+	}
+
+	// 3. Verify GET /swagger redirects to /swagger/
+	{
+		req := httptest.NewRequest(http.MethodGet, "/swagger", nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMovedPermanently {
+			t.Fatalf("expected /swagger to return 301 Moved Permanently, got %d", rec.Code)
+		}
+		if loc := rec.Header().Get("Location"); loc != "/swagger/" {
+			t.Errorf("expected Location header '/swagger/', got '%s'", loc)
+		}
+	}
+
+	// 4. Verify GET /swagger/ serves Swagger UI with relative url="../docs/openapi.json"
+	{
+		req := httptest.NewRequest(http.MethodGet, "/swagger/", nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected /swagger/ to return 200 OK, got %d", rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, `url: "../docs/openapi.json"`) {
+			t.Errorf("expected Swagger UI to reference '../docs/openapi.json', body was:\n%s", body)
+		}
+	}
+
+	// 5. Verify GET /docs/openapi.json serves valid JSON containing relative server definition
+	{
+		req := httptest.NewRequest(http.MethodGet, "/docs/openapi.json", nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected /docs/openapi.json to return 200 OK, got %d", rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, `"url": "./"`) {
+			t.Errorf("expected openapi.json to define relative server url './', body was:\n%s", body)
+		}
+	}
+
+	// 6. Verify GET /docs/openapi.yaml serves valid YAML containing relative server definition
+	{
+		req := httptest.NewRequest(http.MethodGet, "/docs/openapi.yaml", nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected /docs/openapi.yaml to return 200 OK, got %d", rec.Code)
+		}
+		body := rec.Body.String()
+		if !strings.Contains(body, "- url: ./") {
+			t.Errorf("expected openapi.yaml to define relative server url './', body was:\n%s", body)
+		}
+	}
 }

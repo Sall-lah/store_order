@@ -145,7 +145,12 @@ func registerDocumentationRoutes(r *chi.Mux) {
 	})
 
 	// Modern Scalar UI
+	// Why: Normalizing trailing slashes ensures browser relative path resolution deterministically targets ./openapi.json
 	r.Get("/docs", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, r.URL.Path+"/", http.StatusMovedPermanently)
+	})
+
+	r.Get("/docs/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		html := `<!doctype html>
 <html>
@@ -155,7 +160,7 @@ func registerDocumentationRoutes(r *chi.Mux) {
     <meta name="viewport" content="width=device-width, initial-scale=1" />
   </head>
   <body>
-    <script id="api-reference" data-url="/docs/openapi.json"></script>
+    <script id="api-reference" data-url="./openapi.json"></script>
     <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
   </body>
 </html>`
@@ -164,7 +169,12 @@ func registerDocumentationRoutes(r *chi.Mux) {
 	})
 
 	// Classic Swagger UI
+	// Why: Trailing slash redirect ensures relative '../docs/openapi.json' resolves against the common base path
 	r.Get("/swagger", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, r.URL.Path+"/", http.StatusMovedPermanently)
+	})
+
+	r.Get("/swagger/", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		html := `<!DOCTYPE html>
 <html lang="en">
@@ -179,7 +189,7 @@ func registerDocumentationRoutes(r *chi.Mux) {
   <script>
     window.onload = function() {
       SwaggerUIBundle({
-        url: "/docs/openapi.json",
+        url: "../docs/openapi.json",
         dom_id: '#swagger-ui',
         deepLinking: true
       });
@@ -196,6 +206,8 @@ func serveFileIfExists(w http.ResponseWriter, r *http.Request, relPath string) {
 	candidates := []string{
 		relPath,
 		filepath.Join(".", relPath),
+		filepath.Join("..", relPath),
+		filepath.Join("..", "..", relPath),
 		filepath.Join("/app", relPath),
 	}
 

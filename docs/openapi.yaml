@@ -27,6 +27,8 @@ info:
     - Fail-Open policy: Allows traffic if Redis is unreachable or latency exceeds 25ms (`X-RateLimit-Degraded: true`).
 
 servers:
+  - url: ./
+    description: Current Gateway / Relative Origin
   - url: http://localhost:8060
     description: Local Order Service
   - url: /
